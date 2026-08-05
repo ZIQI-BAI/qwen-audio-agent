@@ -280,7 +280,7 @@ export class RealtimeFrontend {
   }
 
   commitAudio() {
-    return this.enqueueResponse('model', {}, async () => {
+    return this.enqueueResponse('model', {}, async pending => {
       const committed = new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           if (this.audioCommitWaiter?.resolve !== resolve) return
@@ -291,6 +291,7 @@ export class RealtimeFrontend {
       })
       this.send({ type: 'input_audio_buffer.commit' })
       await committed
+      if (!this.pendingResponses.includes(pending)) return
       this.send(this.protocol.responseCreate())
     })
   }
@@ -549,6 +550,7 @@ export class RealtimeFrontend {
         if (!error.realtimeEvent) this.onError?.(error)
         return outcome
       }
+      if (!this.pendingResponses.includes(pending)) return outcome
       if (!pending.settled) {
         pending.timer = setTimeout(() => {
           const index = this.pendingResponses.indexOf(pending)
