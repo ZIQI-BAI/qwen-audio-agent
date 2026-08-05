@@ -278,6 +278,10 @@ export class RealtimeFrontend {
     this.send(this.protocol.audioAppend(audio))
   }
 
+  commitAudio() {
+    this.send({ type: 'input_audio_buffer.commit' })
+  }
+
   sendUserText(text, context = {}, { modalities } = {}) {
     const content = String(text || '').trim()
     if (!content) return Promise.resolve()

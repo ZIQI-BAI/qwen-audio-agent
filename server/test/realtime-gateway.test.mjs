@@ -6,6 +6,11 @@ import {
   rejectUnsupportedRealtimeUpgrade,
 } from '../src/voice/realtime-gateway.mjs'
 import { isResponseActivityEvent } from '../src/voice/response-lifecycle.mjs'
+import { GatewayClientEvent } from '../../shared/realtime-events.mjs'
+
+test('exposes audio.commit as a supported gateway client event', () => {
+  assert.equal(GatewayClientEvent.AUDIO_COMMIT, 'audio.commit')
+})
 
 test('closes websocket upgrades outside the realtime endpoint', () => {
   let destroyed = false

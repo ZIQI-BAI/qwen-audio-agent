@@ -2113,6 +2113,11 @@ export function attachRealtimeGateway(server, {
         } catch (error) {
           send(ws, { type: GatewayServerEvent.ERROR, message: error.message })
         }
+      } else if (event.type === GatewayClientEvent.AUDIO_COMMIT) {
+        if (!inputEnabled || !activeVoiceClients.isActive(ownerId, voiceClient)) return
+        ensureFrontend()
+          .then(() => frontend?.commitAudio())
+          .catch(error => send(ws, { type: GatewayServerEvent.ERROR, message: error.message }))
       } else if (event.type === GatewayClientEvent.INTERRUPT) {
         sleepController.recordActivity()
         turnGeneration = ++turnSequence

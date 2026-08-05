@@ -53,6 +53,19 @@ function createQwenFrontend(options = {}) {
   })
 }
 
+test('commits externally framed realtime audio to the provider input buffer', () => {
+  const frontend = createQwenFrontend()
+  frontend.ready = true
+  const sent = []
+  frontend.send = event => sent.push(event)
+  frontend.appendAudio('AQI=')
+  frontend.commitAudio()
+  assert.deepEqual(sent, [
+    { type: 'input_audio_buffer.append', audio: 'AQI=' },
+    { type: 'input_audio_buffer.commit' },
+  ])
+})
+
 test('projects input parts through the realtime provider boundary', () => {
   const frontend = createQwenFrontend()
   const projection = frontend.projectUserInput([
