@@ -117,6 +117,7 @@ export class RealtimeFrontend {
     this.pendingResponses = []
     this.responseWaiters = new Map()
     this.conversationItemWaiters = new Map()
+    this.audioCommitWaiter = null
     this.idleWaiters = []
     this.outputQueue = Promise.resolve()
     this.responseQueueGeneration = 0
@@ -279,7 +280,19 @@ export class RealtimeFrontend {
   }
 
   commitAudio() {
-    this.send({ type: 'input_audio_buffer.commit' })
+    return this.enqueueResponse('model', {}, async () => {
+      const committed = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (this.audioCommitWaiter?.resolve !== resolve) return
+          this.audioCommitWaiter = null
+          reject(new Error('Realtime 音频提交确认超时'))
+        }, this.responseStartTimeoutMs)
+        this.audioCommitWaiter = { resolve, reject, timer }
+      })
+      this.send({ type: 'input_audio_buffer.commit' })
+      await committed
+      this.send(this.protocol.responseCreate())
+    })
   }
 
   sendUserText(text, context = {}, { modalities } = {}) {
@@ -550,6 +563,18 @@ export class RealtimeFrontend {
   }
 
   handleLifecycle(event) {
+    if (event.type === 'input_audio_buffer.committed' && this.audioCommitWaiter) {
+      const waiter = this.audioCommitWaiter
+      this.audioCommitWaiter = null
+      clearTimeout(waiter.timer)
+      waiter.resolve(event)
+    }
+    if (event.type === 'error' && this.audioCommitWaiter) {
+      const waiter = this.audioCommitWaiter
+      this.audioCommitWaiter = null
+      clearTimeout(waiter.timer)
+      waiter.reject(new Error(event.error?.message || 'Qwen 音频提交失败'))
+    }
     if (event.type === 'conversation.item.created') {
       const id = event.item?.id
       const waiter = this.conversationItemWaiters.get(id)
@@ -778,6 +803,11 @@ export class RealtimeFrontend {
     this.responseQueueGeneration += 1
     this.activeResponses.clear()
     this.rejectConversationItemWaiters(new Error('Realtime 会话已重置'))
+    if (this.audioCommitWaiter) {
+      clearTimeout(this.audioCommitWaiter.timer)
+      this.audioCommitWaiter.reject(new Error('Realtime 会话已重置'))
+      this.audioCommitWaiter = null
+    }
     this.pendingResponses.forEach(item => this.settlePending(item, { cancelled: true }))
     this.responseWaiters.forEach(item => this.settlePending(item, { cancelled: true }))
     this.pendingResponses = []

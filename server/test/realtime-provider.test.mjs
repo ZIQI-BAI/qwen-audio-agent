@@ -53,17 +53,29 @@ function createQwenFrontend(options = {}) {
   })
 }
 
-test('commits externally framed realtime audio to the provider input buffer', () => {
+test('commits externally framed realtime audio and explicitly creates a response', async () => {
   const frontend = createQwenFrontend()
   frontend.ready = true
   const sent = []
   frontend.send = event => sent.push(event)
   frontend.appendAudio('AQI=')
-  frontend.commitAudio()
+  const completion = frontend.commitAudio()
+  await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(sent, [
     { type: 'input_audio_buffer.append', audio: 'AQI=' },
     { type: 'input_audio_buffer.commit' },
   ])
+
+  frontend.handleLifecycle({ type: 'input_audio_buffer.committed', item_id: 'item_commit' })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(sent, [
+    { type: 'input_audio_buffer.append', audio: 'AQI=' },
+    { type: 'input_audio_buffer.commit' },
+    { type: 'response.create' },
+  ])
+  frontend.handleLifecycle({ type: 'response.created', response: { id: 'response_commit' } })
+  frontend.handleLifecycle({ type: 'response.done', response: { id: 'response_commit' } })
+  await completion
 })
 
 test('projects input parts through the realtime provider boundary', () => {
@@ -390,6 +402,14 @@ test('configures Qwen Audio Realtime with Smart Turn only', () => {
     )).function.description,
     /用户回答“可以”.*应调用 always/,
   )
+})
+
+test('configures externally framed push-to-talk audio without Smart Turn', () => {
+  const session = REALTIME_PROVIDERS.qwen.buildSession({
+    configured: false,
+    agentContext: { manualTurnDetection: true },
+  })
+  assert.equal(session.turn_detection, null)
 })
 
 test('resolves exact DashScope model profiles for sessions and responses', t => {

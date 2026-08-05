@@ -203,6 +203,7 @@ export function attachRealtimeGateway(server, {
     let userSpeaking = false
     let inputEnabled = false
     let outputEnabled = false
+    let manualTurnDetection = false
     // Set only by host arbitration. Unlike inputEnabled (which the client
     // declares about itself) this means the client has been ordered to stop
     // capturing, so nothing here may re-enable audio on its own.
@@ -1510,6 +1511,7 @@ export function attachRealtimeGateway(server, {
         providerRegistry: realtimeProviderRegistry,
         agentContext: {
           client: clientContext,
+          manualTurnDetection,
           memories: memoryService?.list(ownerId, { limit: 64 }) || [],
           recentMessages: conversationSync.frontendContext({ ownerId, sessionId }),
         },
@@ -1948,6 +1950,7 @@ export function attachRealtimeGateway(server, {
           textOnly: event.textOnly === true,
         })
         nonVoiceClient = event.textOnly === true
+        manualTurnDetection = event.manualTurnDetection === true
         // The client may pick a realtime front end per session. An unknown
         // name is reported instead of silently falling back, so a typo does
         // not look like a working session on the wrong provider.
