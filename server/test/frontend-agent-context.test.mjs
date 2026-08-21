@@ -90,6 +90,17 @@ test('keeps client capabilities out of the runtime prose context', () => {
   assert.doesNotMatch(desktop, /enter_sleep|does not cancel background work/)
 })
 
+test('preserves a bounded client identity instruction in frontend context', () => {
+  const instruction = '你是当前用户的数字分身，帮助处理协同事务、学习知识和记录灵感。'
+  const client = normalizeClientContext({
+    timeZone: 'Asia/Shanghai', locale: 'zh-CN', instruction,
+  })
+  assert.equal(client.instruction, instruction)
+  const context = buildFrontendContext({ client })
+  assert.match(context, /<client_identity_instruction>/)
+  assert.match(context, /当前用户的数字分身/)
+})
+
 test('loads one canonical frontend policy separately from runtime context', () => {
   const prompt = loadFrontendPrompt()
   const assistant = loadAssistantProfile()
