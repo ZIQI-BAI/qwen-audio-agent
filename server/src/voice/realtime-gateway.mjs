@@ -1866,6 +1866,7 @@ export function attachRealtimeGateway(server, {
           timeZone: event.timeZone,
           locale: event.locale,
           workingDirectory: event.workingDirectory,
+          instruction: event.instruction,
         })
         clientContext.states = (
           descriptor.type === 'desktop'
