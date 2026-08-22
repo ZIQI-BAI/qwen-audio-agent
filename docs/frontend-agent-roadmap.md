@@ -14,13 +14,13 @@
 前台 Realtime 当前基础工具如下（`architecture.md` §3 明文规定）：
 
 ```
-spawn_thinking / schedule_reminder / cancel_agent_task / get_agent_task_status
+delegate_to_codex / schedule_reminder / cancel_agent_task / get_agent_task_status
 get_current_time / memory / notes / respond_agent_permission
 ```
 
 （另有 `enter_sleep` 仅在客户端声明 `sleeping` 状态时附加，不属于基础工具集。）
 
-其余一切可执行请求经 `spawn_thinking` 走 owner FIFO 异步队列交给后台 Agent。
+其余一切可执行请求经 `delegate_to_codex` 走 owner FIFO 异步队列交给后台 Agent。
 
 ## 二、与 General Agent 的能力对比
 
@@ -96,12 +96,12 @@ control query（排在 running turn 之后、普通队列之前）已验证该�
 - [ ] **Q1** 设计：quick-query lane 语义定稿
       - 不创建用户可见 Work，不进 FIFO 队尾
       - latency 上限（如 15s），超时降级为正式 Work 并告知用户
-      - 仅只读型查询（查资料/问用法/看状态），写操作仍走 spawn_thinking
+      - 仅只读型查询（查资料/问用法/看状态），写操作仍走 delegate_to_codex
       - 前台先说半句承接，结果到达后经 Announcement 路径自然续上
 - [ ] **Q2** ACP adapter：control-query 机制泛化（复用协调 Session、优先级
       插队、结果关联逻辑）
 - [ ] **Q3** 新前台工具（如 `quick_lookup`）+ PROMPT.md 路由规则（何时
-      quick、何时 spawn_thinking）
+      quick、何时 delegate_to_codex）
 - [ ] **Q4** `architecture.md` §3 工具清单与 §2 流程图更新——**此项涉及
       架构不变量，需明确评审**
 - [ ] **Q5** 测试：插队优先级、超时降级、打断时丢弃悬空查询
@@ -146,7 +146,7 @@ control query（排在 running turn 之后、普通队列之前）已验证该�
 2. 需要权限确认的写操作执行体只在后台；前台仅转述意图
    （`respond_agent_permission` 模式已正确，保持）
 3. 双工语音全程可打断；后台排队/执行不阻塞对话
-4. `spawn_thinking` 语义不变：objective 是意图交接，不是执行计划
+4. `delegate_to_codex` 语义不变：objective 是意图交接，不是执行计划
 
 ## 六、依赖与顺序建议
 

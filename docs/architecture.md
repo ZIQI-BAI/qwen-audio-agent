@@ -30,7 +30,7 @@ final ASR
    ├─ immediately answerable ───────────────► Realtime speech
    │
    └─ requires work
-          │ spawn_thinking(objective)
+          │ delegate_to_codex(objective)
           ▼
       Work accepted
           │ response returns to Realtime immediately
@@ -47,7 +47,7 @@ final ASR
       Realtime naturally speaks the result
 ```
 
-`spawn_thinking` never waits for the requested work. The user can continue
+`delegate_to_codex` never waits for the requested work. The user can continue
 speaking while multiple Work items are queued. For each owner, only one Work
 item is sent into the Backend Agent Session at a time.
 
@@ -57,7 +57,7 @@ Realtime keeps a deliberately small tool set — few tools, low latency, no
 multi-step orchestration. The base tools are:
 
 ```text
-spawn_thinking
+delegate_to_codex
 schedule_reminder
 cancel_agent_task
 get_agent_task_status
@@ -129,7 +129,7 @@ utterance, create a request, choose a tool, or modify a backend permission
 policy. Replies are limited to `always` and `reject`; `always` uses the
 backend's Session-scoped permission option when available.
 
-The `objective` passed to `spawn_thinking` is a conservative interpretation of
+The `objective` passed to `delegate_to_codex` is a conservative interpretation of
 the user's request, not an execution plan. Recent voice context is separately
 included in the backend Agent envelope so references such as “continue that
 page” remain understandable. Final ASR remains the source of truth. The Gateway
@@ -306,7 +306,7 @@ state, never delegation IDs, target Session IDs, directories, or raw events.
 WebUI / TUI / Desktop
    ↓ WebSocket and HTTP
 Realtime Gateway
-   ↓ spawn_thinking
+   ↓ delegate_to_codex
 Work queue
    ↓
 backend Agent envelope

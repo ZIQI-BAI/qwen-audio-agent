@@ -29,7 +29,7 @@ A staged attachment can accompany either composer text or the next voice turn.
 Deleting its anchor from the composer also removes the staged attachment.
 
 The TUI reads attachment content and sends it to the Gateway. The realtime voice
-frontend receives metadata only. When it delegates through `spawn_thinking`, the
+frontend receives metadata only. When it delegates through `delegate_to_codex`, the
 Gateway converts the original attachments into ACP ContentBlocks for the backend
 agent. Text anchors such as `[Image 1]` or `@file-path` remain bound to their file
 parts for multi-attachment references, replay, and backend interpretation. Each

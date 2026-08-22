@@ -143,7 +143,7 @@ test('submits one nonblocking coordinator work item with organized intent', asyn
   kit.transcripts.record('turn-one', '继续改刚才那个页面')
   await kit.handler.handle({
     call_id: 'call-one',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: JSON.stringify({ objective: '继续修改此前讨论的页面' }),
   }, { turnId: 'turn-one', turnGeneration: 1 })
 
@@ -183,7 +183,7 @@ test('automatically carries current-turn attachments into spawned work', async (
   kit.transcripts.recordParts('turn-one', [image])
   await kit.handler.handle({
     call_id: 'call-image',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"根据参考图生成皮肤"}',
   }, { turnId: 'turn-one', turnGeneration: 1 })
 
@@ -219,7 +219,7 @@ test('resolves an earlier-turn input reference when the next turn delegates work
 
   await kit.handler.handle({
     call_id: 'call-historical-image',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: JSON.stringify({
       objective: '分析用户此前提供的图片',
       input_refs: ['input_1'],
@@ -240,7 +240,7 @@ test('asks for the attachment again when a referenced input has expired', async 
 
   await kit.handler.handle({
     call_id: 'call-expired-image',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: JSON.stringify({
       objective: '分析用户此前提供的图片',
       input_refs: ['input_1'],
@@ -257,7 +257,7 @@ test('lets realtime avoid a repeated acknowledgement after speaking before deleg
   kit.transcripts.record('turn-one', '给项目添加特殊食物')
   await kit.handler.handle({
     call_id: 'call-spoken-before-tool',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"给项目添加特殊食物"}',
   }, {
     turnId: 'turn-one',
@@ -279,12 +279,12 @@ test('deduplicates repeated tool calls from one realtime turn', async () => {
   kit.transcripts.record('turn-one', '执行一次')
   await kit.handler.handle({
     call_id: 'call-one',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"执行一次"}',
   })
   await kit.handler.handle({
     call_id: 'call-two',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"再执行一次"}',
   })
   assert.equal(kit.manager.list({ ownerId: 'owner' }).length, 1)
@@ -305,7 +305,7 @@ test('rejects delegated work immediately when the backend is known to be down', 
   kit.transcripts.record('turn-one', '帮我修改项目')
   await kit.handler.handle({
     call_id: 'call-offline',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"修改项目"}',
   })
 
@@ -333,7 +333,7 @@ test('accepts optimistically before the first health probe and fails via the tas
   kit.transcripts.record('turn-one', '帮我修改项目')
   await kit.handler.handle({
     call_id: 'call-optimistic',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"修改项目"}',
   })
 
@@ -359,7 +359,7 @@ test('hands out the acceptance receipt without waiting for the turn transcript',
   // dispatch-time resolution falls back to the model-provided objective.
   await kit.handler.handle({
     call_id: 'call-no-transcript',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"整理会议纪要"}',
   }, { turnId: 'turn-one', turnGeneration: 1 })
 
@@ -391,7 +391,7 @@ test('keeps the verbatim request even when later turns evict the transcript', as
   kit.transcripts.record('turn-one', '堆积任务')
   await kit.handler.handle({
     call_id: 'call-blocking',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"堆积任务"}',
   }, { turnId: 'turn-one', turnGeneration: 1 })
 
@@ -399,7 +399,7 @@ test('keeps the verbatim request even when later turns evict the transcript', as
   currentTurn = 'turn-two'
   await kit.handler.handle({
     call_id: 'call-queued',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"发送上周周报"}',
   }, { turnId: 'turn-two', turnGeneration: 1 })
   const queuedId = kit.outputs.at(-1)[1].work_id
@@ -425,7 +425,7 @@ test('explains that background work is unavailable without a configured backend'
   kit.transcripts.record('turn-one', '帮我修改项目')
   await kit.handler.handle({
     call_id: 'call-unconfigured',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"修改项目"}',
   })
 
@@ -451,7 +451,7 @@ test('does not turn a permission answer into a new background task', async () =>
 
   await kit.handler.handle({
     call_id: 'wrongly-delegated-permission-answer',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: JSON.stringify({ objective: '可以' }),
   }, { turnId: 'turn-one', turnGeneration: 1 })
 
@@ -484,7 +484,7 @@ test('deduplicates the same turn after a realtime handler reconnect', async () =
   first.transcripts.record('turn-one', '执行一次')
   await first.handler.handle({
     call_id: 'call-before-reconnect',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"执行一次"}',
   })
 
@@ -492,7 +492,7 @@ test('deduplicates the same turn after a realtime handler reconnect', async () =
   second.transcripts.record('turn-one', '执行一次')
   await second.handler.handle({
     call_id: 'call-after-reconnect',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"执行一次"}',
   })
   await manager.wait(first.outputs[0][1].work_id)
@@ -515,7 +515,7 @@ test('cancels the most recently submitted active work', async () => {
   kit.transcripts.record('turn-one', '执行一次')
   await kit.handler.handle({
     call_id: 'call-one',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"执行一次"}',
   })
   await new Promise(resolve => setImmediate(resolve))
@@ -537,7 +537,7 @@ test('queries the latest work directly from the realtime task ledger', async () 
   kit.transcripts.record('turn-one', '执行一次')
   await kit.handler.handle({
     call_id: 'call-submit',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"执行一次"}',
   })
   const workId = kit.outputs.at(-1)[1].work_id
@@ -761,7 +761,7 @@ test('auto-allows later permissions in the Gateway without publishing them', asy
 
   await kit.handler.handle({
     call_id: 'auto-permission-work',
-    name: 'spawn_thinking',
+    name: 'delegate_to_codex',
     arguments: '{"objective":"检查项目"}',
   })
   await kit.manager.wait(kit.outputs[0][1].work_id)

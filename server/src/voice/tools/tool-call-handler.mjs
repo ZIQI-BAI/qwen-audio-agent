@@ -482,7 +482,7 @@ export class ToolCallHandler {
         {
           response: {
             instructions: [
-              '当前有一项权限请求正在等待决定，本轮不能调用 spawn_thinking。',
+              '当前有一项权限请求正在等待决定，本轮不能调用 delegate_to_codex。',
               '重新结合刚才提出的具体权限问题和本轮用户原话判断。',
               '若用户已自然表达同意或拒绝，立即调用 respond_agent_permission；按语义判断，不要要求固定口令。',
               '若用户没有作出决定，只用一句自然的话继续确认。',
@@ -625,6 +625,12 @@ export class ToolCallHandler {
         verbatimRequest,
         submissionKey,
         inputParts: delegatedInputParts,
+      })
+      this.logger?.info('delegation.accepted', {
+        turnId,
+        requestId: callId,
+        taskId: task.id,
+        tool: SPAWN_THINKING_TOOL_NAME,
       })
     } catch (error) {
       const message = String(error?.message || error || '')

@@ -16,6 +16,7 @@ import { frontendInputProjection } from '../../../shared/input-parts.mjs'
 // Re-export provider-agnostic tools and instructions so existing callers
 // (tests, tool-call-handler, bootstrap) continue to work without changes.
 export {
+  DELEGATE_TO_CODEX_TOOL_NAME,
   SPAWN_THINKING_TOOL_NAME,
   SCHEDULE_REMINDER_TOOL_NAME,
   CANCEL_AGENT_TASK_TOOL_NAME,
@@ -315,12 +316,13 @@ export class RealtimeFrontend {
     return true
   }
 
-  sendUserInput(parts, context = {}, { modalities } = {}) {
+  sendUserInput(parts, context = {}, { modalities, response } = {}) {
     return this.enqueueResponse('model', context, async () => {
       if (!await this.applyUserInput(parts)) return false
-      this.send(this.protocol.responseCreate(
-        modalities ? { modalities } : undefined,
-      ))
+      this.send(this.protocol.responseCreate({
+        ...(response || {}),
+        ...(modalities ? { modalities } : {}),
+      }))
     })
   }
 

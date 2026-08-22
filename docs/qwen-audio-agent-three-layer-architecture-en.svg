@@ -41,7 +41,7 @@
   <rect x="916" y="195" width="128" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
   <text x="980" y="210" text-anchor="middle" font-size="11" font-weight="600" fill="#1d4ed8">Direct answer</text>
   <rect x="427" y="335" width="126" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
-  <text x="490" y="350" text-anchor="middle" font-size="11" font-weight="600" fill="#c2410c">spawn_thinking</text>
+  <text x="490" y="350" text-anchor="middle" font-size="11" font-weight="600" fill="#c2410c">delegate_to_codex</text>
   <rect x="511" y="435" width="82" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
   <text x="552" y="450" text-anchor="middle" font-size="11" font-weight="600" fill="#1d4ed8">Task status</text>
   <rect x="785" y="435" width="90" height="22" rx="6" fill="#ffffff" opacity="0.96"/>

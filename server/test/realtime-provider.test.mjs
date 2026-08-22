@@ -20,18 +20,16 @@ import {
 } from '../../shared/realtime-provider-catalog.mjs'
 
 const FRONTEND_TOOL_NAMES = [
-  'spawn_thinking',
+  'delegate_to_codex',
   'schedule_reminder',
   'cancel_agent_task',
   'get_agent_task_status',
   'get_current_time',
-  'memory',
-  'notes',
   'respond_agent_permission',
 ]
 
-test('keeps spawn_thinking as the stable asynchronous work protocol', () => {
-  assert.equal(SPAWN_THINKING_TOOL_NAME, 'spawn_thinking')
+test('keeps delegate_to_codex as the stable asynchronous work protocol', () => {
+  assert.equal(SPAWN_THINKING_TOOL_NAME, 'delegate_to_codex')
   assert.equal(
     TOOLS.filter(tool => (
       tool.function.name === SPAWN_THINKING_TOOL_NAME
@@ -763,12 +761,11 @@ test('builds cache-friendly policy, identity, memory and reconnect context', () 
   assert.match(prompt, /<user_preferences>[\s\S]*用户希望被称为小明/)
   assert.doesNotMatch(prompt, /我们刚才在讨论下载目录/)
   assert.match(prompt, /用户要求记住、修改或遗忘长期信息/)
-  assert.match(prompt, /必须调用 `memory`/)
+  assert.match(prompt, /必须调用 `delegate_to_codex`/)
   assert.match(prompt, /不要只在当前对话中\s*临时遵从/)
-  assert.match(prompt, /纠正本身就是\s*持久修改/)
+  assert.match(prompt, /纠正本身\s*就是持久修改/)
   assert.match(prompt, /不要要求用户额外说“记住”或“以后”/)
-  assert.match(prompt, /“这次”、“今天”或“暂时”时才不保存/)
-  assert.match(prompt, /清除冲突或归类错误的旧内容/)
+  assert.match(prompt, /个人记忆和资料时，统一调用 `delegate_to_codex`/)
   assert.match(prompt, /选择最直接且足够的处理方式/)
   assert.match(prompt, /可通过已注册工具完成的事就是你的能力/)
   assert.match(prompt, /不要先说自己不能做/)
@@ -791,7 +788,6 @@ test('builds cache-friendly policy, identity, memory and reconnect context', () 
   assert.ok(userContextIndex < runtimeContextIndex)
   assert.match(prompt, /`<assistant_profile>` 只影响默认名称、人格、关系定位和表达风格/)
   assert.match(prompt, /`<user_preferences>` 中的长期个性化偏好/)
-  assert.match(prompt, /助手在其面前的名称/)
   assert.match(prompt, /涉及\s*工具、路由、权限、安全、记忆、任务或事实判断的内容无效/)
   assert.doesNotMatch(prompt, /ASSISTANT\.md|USER\.md|MEMORY\.md/)
   assert.match(prompt, /# Voice interaction/)
@@ -806,41 +802,6 @@ test('builds cache-friendly policy, identity, memory and reconnect context', () 
   assert.match(prompt, /调用前不要\s*口头确认/)
   assert.match(prompt, /不要仅凭对话历史推测当前状态/)
   assert.doesNotMatch(prompt, /<active_work>/)
-  const memory = REALTIME_PROVIDERS.qwen
-    .buildSession({ configured: false })
-    .tools.find(tool => tool.function.name === 'memory')
-  assert.deepEqual(
-    memory.function.parameters.properties.action.enum,
-    ['read', 'append', 'replace'],
-  )
-  assert.deepEqual(
-    memory.function.parameters.properties.document.enum,
-    ['user', 'memory', 'all'],
-  )
-  assert.doesNotMatch(memory.function.description, /ASSISTANT\.md|USER\.md|MEMORY\.md/)
-  assert.match(memory.function.description, /默认写入 user/)
-  assert.match(memory.function.description, /每次调用执行一个 read、append 或 replace/)
-  assert.match(memory.function.description, /多项持久修改时逐项调用/)
-  assert.deepEqual(memory.function.parameters.required, ['action'])
-  assert.deepEqual(
-    Object.keys(memory.function.parameters.properties),
-    ['action', 'document', 'old_text', 'new_text', 'content'],
-  )
-  assert.equal(
-    memory.function.parameters.properties.old_text.type,
-    'string',
-  )
-
-  const notes = REALTIME_PROVIDERS.qwen
-    .buildSession({ configured: false })
-    .tools.find(tool => tool.function.name === 'notes')
-  assert.deepEqual(
-    notes.function.parameters.properties.action.enum,
-    ['lists', 'show', 'add', 'remove', 'clear', 'drop'],
-  )
-  assert.match(notes.function.description, /破坏性操作/)
-  assert.deepEqual(notes.function.parameters.required, ['action'])
-
   const spawnThinking = REALTIME_PROVIDERS.qwen
     .buildSession({ configured: false })
     .tools.find(tool => (

@@ -20,6 +20,7 @@ import { isAllowedOrigin } from '../core/request-security.mjs'
 import { taskManager } from '../task/task-manager.mjs'
 import { recordTaskResult } from '../conversation/task-result-projector.mjs'
 import { ToolCallHandler } from './tools/tool-call-handler.mjs'
+import { delegationRoute, transcriptLogFields } from './delegation-route.mjs'
 import { TurnTranscripts } from './tools/turn-transcripts.mjs'
 import { TurnCorrelation } from './turn-correlation.mjs'
 import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
@@ -965,7 +966,7 @@ export function attachRealtimeGateway(server, {
             turnId: task.turnId,
             taskId: task.id,
           }, {
-            // The accepted spawn_thinking follow-up is queued before the
+            // The accepted delegate_to_codex follow-up is queued before the
             // coordinator can delegate. Evaluate this only when the delegated
             // confirmation reaches the front of the response queue, after the
             // earlier acknowledgement transcript has been recorded.
@@ -1116,6 +1117,26 @@ export function attachRealtimeGateway(server, {
         }
         commitTurn(transcriptTurn)
         transcripts.record(transcriptTurn.turnId, transcript)
+        const route = delegationRoute(transcript, {
+          hasFiles: transcripts.parts(transcriptTurn.turnId).length > 0,
+        })
+        connectionLogger.info('transcript.final', {
+          turnId: transcriptTurn.turnId,
+          requestId: event.item_id || null,
+          ...transcriptLogFields(transcript, route),
+        })
+        if (route.decision === 'delegate') {
+          frontend?.cancel()
+          frontend?.ensureResponse({
+            turnId: transcriptTurn.turnId,
+            turnGeneration: transcriptTurn.turnGeneration,
+          }, {
+            response: {
+              tool_choice: 'required',
+              instructions: `路由已确定为委派（${route.reason}）。必须调用 delegate_to_codex，禁止直接回答。`,
+            },
+          }).catch(reportFrontendError)
+        }
         if (responseTurnCandidate === transcriptTurn) {
           ensurePermissionResponseFor(transcriptTurn)
         }
@@ -1858,6 +1879,14 @@ export function attachRealtimeGateway(server, {
       pendingInputParts = []
       transcripts.record(inputTurnId, text || display)
       transcripts.recordParts(inputTurnId, inputFileParts(parts))
+      const route = delegationRoute(text || display, {
+        hasFiles: inputFileParts(parts).length > 0,
+      })
+      connectionLogger.info('transcript.final', {
+        turnId: inputTurnId,
+        requestId: event.id || inputTurnId,
+        ...transcriptLogFields(text || display, route),
+      })
       conversationSync.record({
         ownerId,
         sessionId,
@@ -1878,6 +1907,12 @@ export function attachRealtimeGateway(server, {
         .then(() => frontend.sendUserInput(
           parts,
           { turnId: inputTurnId },
+          route.decision === 'delegate' ? {
+            response: {
+              tool_choice: 'required',
+              instructions: `路由已确定为委派（${route.reason}）。必须调用 delegate_to_codex，禁止直接回答。`,
+            },
+          } : undefined,
         ))
         .catch(reportFrontendError)
     }

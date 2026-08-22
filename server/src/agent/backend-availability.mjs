@@ -1,5 +1,5 @@
 // Cached backend availability for receipt-based tool acceptance. The voice
-// frontend must hand out spawn_thinking receipts in milliseconds, so it can
+// frontend must hand out delegate_to_codex receipts in milliseconds, so it can
 // never block on a live health probe. This cache answers synchronously from
 // the last known state and refreshes itself in the background; a backend
 // that looks healthy here but fails at dispatch surfaces through the

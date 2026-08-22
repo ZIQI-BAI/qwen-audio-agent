@@ -22,7 +22,7 @@ final ASR
    ├─ immediately answerable ───────────────► Realtime speech
    │
    └─ requires work
-          │ spawn_thinking(objective)
+          │ delegate_to_codex(objective)
           ▼
       Work accepted
           │ response returns to Realtime immediately
@@ -39,7 +39,7 @@ final ASR
       Realtime naturally speaks the result
 ```
 
-`spawn_thinking` 永不等待所请求的工作完成。用户可以在多个 Work 项排队期间继续
+`delegate_to_codex` 永不等待所请求的工作完成。用户可以在多个 Work 项排队期间继续
 说话。对于每个 owner，一次只有一个 Work 项被发送到后端 Agent Session。
 
 ## 3. 实时边界
@@ -47,7 +47,7 @@ final ASR
 实时前端有意保持极小的工具集——工具少、延迟低、无多步编排。基础工具为：
 
 ```text
-spawn_thinking
+delegate_to_codex
 schedule_reminder
 cancel_agent_task
 get_agent_task_status
@@ -105,7 +105,7 @@ Gateway 直接回答非委派 Work。对于 `delegated` Work，它创建一个�
 回复仅限于 `always` 和 `reject`；`always` 在可用时使用后端的 Session 作用域
 权限选项。
 
-传递给 `spawn_thinking` 的 `objective` 是对用户请求的保守解释，而非执行计划。
+传递给 `delegate_to_codex` 的 `objective` 是对用户请求的保守解释，而非执行计划。
 最近的语音上下文会单独包含在后端 Agent 信封中，因此诸如"继续那个页面"之类的
 引用仍然可以理解。final ASR 仍然是事实来源。当前轮附件由 Gateway 自动随任务
 传递；只有任务明确依赖此前轮次的图片或文件时，前台才通过可选的 `input_refs`
@@ -252,7 +252,7 @@ send、status 和 cancel。OpenClaw ACP 不接受客户端提供的 MCP 服务�
 WebUI / TUI / Desktop
    ↓ WebSocket and HTTP
 Realtime Gateway
-   ↓ spawn_thinking
+   ↓ delegate_to_codex
 Work queue
    ↓
 backend agent envelope
