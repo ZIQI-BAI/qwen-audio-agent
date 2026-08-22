@@ -59,8 +59,18 @@ const PERMISSION_RESPONSE_GRACE_MS = 800
 const RESPONSE_CONTEXT_CLEANUP_MS = 30000
 const REALTIME_STABLE_CONNECTION_MS = 10000
 
-function send(ws, event) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
+/**
+ * `onFlush` is invoked once the frame has been written out (ws.send's own
+ * completion callback), or immediately with an error when the socket is not
+ * open. Only the deactivate path uses it: everywhere else the write completion
+ * carries no information worth a callback.
+ */
+function send(ws, event, onFlush) {
+  if (ws.readyState !== WebSocket.OPEN) {
+    onFlush?.(new Error('socket_not_open'))
+    return
+  }
+  ws.send(JSON.stringify(event), onFlush)
 }
 
 function rejectUpgrade(socket, status, message) {
@@ -375,10 +385,13 @@ export function attachRealtimeGateway(server, {
         cancelScheduledRealtimeReconnect()
         frontend?.close()
         send(ws, { type: 'playback.clear' })
+        // The write completion is the only deactivate-side event that can be
+        // late: it is where a server-side stall would show up, separately from
+        // how long this connection then lingers.
         send(ws, {
           type: 'voice.deactivated',
           holder: replacement?.descriptor || null,
-        })
+        }, error => ownership.noteDeactivateFlushed(descriptor, { error }))
       },
     }
     if (!voiceConnections.has(ownerId)) voiceConnections.set(ownerId, new Set())
@@ -391,10 +404,13 @@ export function attachRealtimeGateway(server, {
       broadcastVoiceOwnership(ownerId)
       return result.granted
     }
-    const releaseVoiceClient = () => {
+    // `reason` distinguishes the three ways a connection gives the slot up —
+    // they are different claims about the socket's lifetime and must not be
+    // logged as if they were one.
+    const releaseVoiceClient = (reason = 'unspecified') => {
       inputEnabled = false
       outputEnabled = false
-      if (ownership.release(voiceClient, descriptor)) {
+      if (ownership.release(voiceClient, descriptor, { reason })) {
         broadcastVoiceOwnership(ownerId)
       }
     }
@@ -1963,7 +1979,7 @@ export function attachRealtimeGateway(server, {
             enableOutput: capabilities.outputEnabled,
           })
         } else {
-          releaseVoiceClient()
+          releaseVoiceClient('text_only')
           inputEnabled = capabilities.inputEnabled
           outputEnabled = capabilities.outputEnabled
           broadcastVoiceOwnership(ownerId)
@@ -2131,7 +2147,7 @@ export function attachRealtimeGateway(server, {
         }
       } else if (event.type === GatewayClientEvent.MUTE) {
         explicitSleepRequested = false
-        releaseVoiceClient()
+        releaseVoiceClient('mute')
         sleeping = false
         waking = false
         sleepController?.disable()
@@ -2164,7 +2180,7 @@ export function attachRealtimeGateway(server, {
       connectionLogger.info('voice_client.disconnected', {
         clientType: descriptor.type,
       })
-      releaseVoiceClient()
+      releaseVoiceClient('socket_closed')
       const connections = voiceConnections.get(ownerId)
       connections?.delete(voiceClient)
       if (!connections?.size) voiceConnections.delete(ownerId)

@@ -81,6 +81,40 @@ export function deactivationRecord({
 }
 
 /**
+ * The `voice.deactivated` frame actually leaving this server.
+ *
+ * ActiveVoiceClients.activate() evicts inline, so the deactivate *callback*
+ * can never be late. The deactivate *frame* can: ws.send()'s completion
+ * callback only fires once the payload is written out, so a backpressured or
+ * half-dead socket shows up here as seconds. This is the one deactivate-side
+ * event that can legitimately carry the ESS-974 delay, and it splits the
+ * question in two — a large `flushLatencyMs` puts the delay on this server, a
+ * near-zero one puts it on the network or the client.
+ *
+ * It is a *write* completion, not a client receipt. Nothing server-side can
+ * observe when the watch processed the frame.
+ */
+export function deactivateFlushedRecord({
+  descriptor,
+  superseded,
+  flushedAt,
+  error = null,
+}) {
+  const claimedAt = Number.isFinite(superseded?.claimedAt)
+    ? superseded.claimedAt
+    : null
+  return {
+    takeoverId: superseded?.takeoverId || null,
+    evicted: ownershipParty(descriptor),
+    replacedBy: superseded?.replacedBy || null,
+    delivered: !error,
+    error: error ? String(error.message || error) : null,
+    flushedAt: new Date(flushedAt).toISOString(),
+    flushLatencyMs: claimedAt === null ? null : flushedAt - claimedAt,
+  }
+}
+
+/**
  * Closes the takeover out, on the evicted connection's own teardown.
  *
  * The two boundaries are both real production events, on two different
@@ -88,14 +122,21 @@ export function deactivationRecord({
  *
  *   A. `voice_ownership.claim` stamps `takeoverAt` when the newcomer wins
  *      arbitration (realtime-gateway.mjs, before activate()).
- *   B. this record is written when the connection that lost the slot finally
- *      reaches release() — i.e. its websocket closed.
+ *   B. this record is written when the connection that lost the slot reaches
+ *      release() — websocket close, an explicit mute, or the client dropping
+ *      to text-only. `releaseReason` says which, because they are not the same
+ *      claim about the socket's lifetime.
  *
- * B - A is `supersededLingerMs`: how long a superseded connection stayed alive
- * on this server after losing ownership. That is the window ESS-974 needs, and
- * the only one a late `voice.deactivated` can arrive inside.
+ * B - A is `supersededLingerMs`: how long a superseded connection kept the
+ * gateway's voice state alive after losing ownership. That is the window a
+ * late `voice.deactivated` can arrive inside.
  */
-export function supersedeSettledRecord({ descriptor, superseded, closedAt }) {
+export function supersedeSettledRecord({
+  descriptor,
+  superseded,
+  releasedAt,
+  releaseReason = 'unspecified',
+}) {
   const claimedAt = Number.isFinite(superseded?.claimedAt)
     ? superseded.claimedAt
     : null
@@ -104,9 +145,10 @@ export function supersedeSettledRecord({ descriptor, superseded, closedAt }) {
     takeoverId: superseded?.takeoverId || null,
     evicted: ownershipParty(descriptor),
     replacedBy: superseded?.replacedBy || null,
+    releaseReason,
     claimedAt: claimedAt === null ? null : new Date(claimedAt).toISOString(),
-    closedAt: new Date(closedAt).toISOString(),
-    supersededLingerMs: claimedAt === null ? null : closedAt - claimedAt,
+    releasedAt: new Date(releasedAt).toISOString(),
+    supersededLingerMs: claimedAt === null ? null : releasedAt - claimedAt,
     // Carried along so one line shows both numbers: nobody can mistake the
     // synchronous arbitration cost for the cross-connection linger again.
     arbitrationLatencyMs: superseded?.arbitrationLatencyMs ?? null,

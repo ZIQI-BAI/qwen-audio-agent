@@ -211,7 +211,11 @@ function voiceConnection({ clients, logger, now, instanceId, lingerWarnMs = 1_00
     descriptor,
     tracker,
     claim: (options = {}) => tracker.claim(client, descriptor, options),
-    close: () => tracker.release(client, descriptor),
+    // ws.send()'s completion callback for the `voice.deactivated` frame.
+    flushDeactivate: (error = null) =>
+      tracker.noteDeactivateFlushed(descriptor, { error }),
+    release: (reason = 'socket_closed') =>
+      tracker.release(client, descriptor, { reason }),
   }
 }
 
@@ -228,9 +232,12 @@ test('ESS-974 replay: a superseded connection lingering 5530ms is measured end t
   now.advance(30_000)
   round3.claim({ takeover: true })
 
-  // ESS-974: 02:19:25.089 supersede → 02:19:30.617 the old socket is gone.
+  // The deactivate frame is written out promptly...
+  round2.flushDeactivate()
+  // ...but the connection itself is only gone 5.53s later, as in ESS-974
+  // (02:19:25.089 supersede → 02:19:30.617).
   now.advance(5_530)
-  round2.close()
+  round2.release('socket_closed')
 
   const [, claim] = logger.find('voice_ownership.claim')
   assert.equal(claim.granted, true)
@@ -247,8 +254,16 @@ test('ESS-974 replay: a superseded connection lingering 5530ms is measured end t
 
   // Boundary B: the interval is derived by production code from the two event
   // timestamps, not supplied by this test.
-  const [settled] = logger.find('voice_ownership.superseded_closed')
+  // The frame left the server immediately, so the 5.53s is not a server-side
+  // write stall — that is the split this record exists to make.
+  const [flushed] = logger.find('voice_ownership.deactivate_flushed')
+  assert.equal(flushed.delivered, true)
+  assert.equal(flushed.flushLatencyMs, 0)
+  assert.equal(flushed.takeoverId, logger.find('voice_ownership.claim').at(-1).takeoverId)
+
+  const [settled] = logger.find('voice_ownership.superseded_released')
   assert.equal(settled.supersededLingerMs, 5_530)
+  assert.equal(settled.releaseReason, 'socket_closed')
   assert.equal(settled.evicted.instanceId, 'inst_old_a1b2')
   assert.equal(settled.replacedBy.instanceId, 'inst_new_c3d4')
   assert.equal(settled.evicted.label, settled.replacedBy.label)
@@ -256,7 +271,7 @@ test('ESS-974 replay: a superseded connection lingering 5530ms is measured end t
   // the label, which is identical on both sides.
   assert.equal(settled.takeoverId, claim.takeoverId)
   assert.equal(
-    new Date(settled.closedAt) - new Date(settled.claimedAt),
+    new Date(settled.releasedAt) - new Date(settled.claimedAt),
     5_530,
   )
   // Both numbers on one line, so nobody reads the arbitration cost as the delay.
@@ -277,9 +292,10 @@ test('a takeover whose loser closes at once is not confused with a late one', ()
   incumbent.claim({ takeover: false })
   claimant.claim({ takeover: true })
   // No clock advance: the loser tears down inside the same tick.
-  incumbent.close()
+  incumbent.flushDeactivate()
+  incumbent.release('socket_closed')
 
-  const [settled] = logger.find('voice_ownership.superseded_closed')
+  const [settled] = logger.find('voice_ownership.superseded_released')
   assert.equal(settled.supersededLingerMs, 0)
   // Identical arbitration cost as the 5530ms case above — which is precisely
   // why arbitration cost cannot be the signal. Only the linger separates them.
@@ -301,12 +317,12 @@ test('a connection that wins the slot back does not report a stale linger', () =
   // The evicted connection takes the slot back instead of dying.
   first.claim({ takeover: true })
   now.advance(60_000)
-  first.close()
+  first.release('socket_closed')
 
-  assert.equal(logger.find('voice_ownership.superseded_closed').length, 0)
+  assert.equal(logger.find('voice_ownership.superseded_released').length, 0)
 })
 
-test('mute followed by close reports the superseded window once', () => {
+test('a window closed by mute says mute, not socket close', () => {
   const logger = recordingLogger()
   const clients = new ActiveVoiceClients()
   const now = fakeClock()
@@ -316,13 +332,84 @@ test('mute followed by close reports the superseded window once', () => {
   incumbent.claim({ takeover: false })
   claimant.claim({ takeover: true })
   now.advance(5_530)
-  incumbent.close()
+  // The gateway releases on mute too. Reporting that as a socket close would
+  // make an operator draw the wrong conclusion about the connection's life.
+  incumbent.release('mute')
   now.advance(90_000)
-  incumbent.close()
+  incumbent.release('socket_closed')
 
-  const settled = logger.find('voice_ownership.superseded_closed')
+  const settled = logger.find('voice_ownership.superseded_released')
   assert.equal(settled.length, 1)
   assert.equal(settled[0].supersededLingerMs, 5_530)
+  assert.equal(settled[0].releaseReason, 'mute')
+  assert.equal('closedAt' in settled[0], false)
+  // The release records themselves still name every hand-back.
+  assert.deepEqual(
+    logger.find('voice_ownership.released').map(record => record.reason),
+    ['mute', 'socket_closed'],
+  )
+})
+
+test('a deactivate frame that takes 5530ms to write out is attributed to the write', () => {
+  const logger = recordingLogger()
+  const clients = new ActiveVoiceClients()
+  const now = fakeClock()
+  const incumbent = voiceConnection({ clients, logger, now, instanceId: 'inst_a' })
+  const claimant = voiceConnection({ clients, logger, now, instanceId: 'inst_b' })
+
+  incumbent.claim({ takeover: false })
+  claimant.claim({ takeover: true })
+  // Backpressured socket: ws.send's completion callback only fires 5.53s later.
+  now.advance(5_530)
+  incumbent.flushDeactivate()
+
+  const [flushed] = logger.find('voice_ownership.deactivate_flushed')
+  assert.equal(flushed.flushLatencyMs, 5_530)
+  assert.equal(flushed.delivered, true)
+  assert.equal(flushed.level, 'warn')
+  assert.equal(flushed.evicted.instanceId, 'inst_a')
+  assert.equal(flushed.replacedBy.instanceId, 'inst_b')
+  assert.equal(
+    flushed.takeoverId,
+    logger.find('voice_ownership.claim').at(-1).takeoverId,
+  )
+})
+
+test('a deactivate frame that never goes out is recorded as undelivered', () => {
+  const logger = recordingLogger()
+  const clients = new ActiveVoiceClients()
+  const now = fakeClock()
+  const incumbent = voiceConnection({ clients, logger, now, instanceId: 'inst_a' })
+  const claimant = voiceConnection({ clients, logger, now, instanceId: 'inst_b' })
+
+  incumbent.claim({ takeover: false })
+  claimant.claim({ takeover: true })
+  incumbent.flushDeactivate(new Error('socket_not_open'))
+
+  const [flushed] = logger.find('voice_ownership.deactivate_flushed')
+  assert.equal(flushed.delivered, false)
+  assert.equal(flushed.error, 'socket_not_open')
+  assert.equal(flushed.level, 'warn')
+})
+
+test('the write completion is reported even after the connection is gone', () => {
+  const logger = recordingLogger()
+  const clients = new ActiveVoiceClients()
+  const now = fakeClock()
+  const incumbent = voiceConnection({ clients, logger, now, instanceId: 'inst_a' })
+  const claimant = voiceConnection({ clients, logger, now, instanceId: 'inst_b' })
+
+  incumbent.claim({ takeover: false })
+  claimant.claim({ takeover: true })
+  // release() closes the linger window; the pending write is tracked apart
+  // from it, so a late completion still lands.
+  incumbent.release('socket_closed')
+  now.advance(400)
+  incumbent.flushDeactivate()
+
+  assert.equal(logger.find('voice_ownership.superseded_released').length, 1)
+  const [flushed] = logger.find('voice_ownership.deactivate_flushed')
+  assert.equal(flushed.flushLatencyMs, 400)
 })
 
 test('a refused claim is logged as refused, not as a silent no-op', () => {

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   claimRecord,
+  deactivateFlushedRecord,
   deactivationRecord,
   releaseRecord,
   supersedeSettledRecord,
@@ -28,8 +29,11 @@ export class VoiceOwnershipTracker {
     this.logger = logger
     this.now = now
     this.lingerWarnMs = Math.max(0, Number(lingerWarnMs) || 0)
-    // Set while this connection has lost the slot but has not yet torn down.
+    // Set while this connection has lost the slot but has not yet released.
     this.superseded = null
+    // Kept separately: the frame's write can complete after release() already
+    // closed the linger window, and vice versa.
+    this.pendingFlush = null
   }
 
   /**
@@ -75,7 +79,7 @@ export class VoiceOwnershipTracker {
       hadOutput,
     })
     this.logger.info('voice_ownership.deactivated', record)
-    this.superseded = {
+    const superseded = {
       takeoverId: record.takeoverId,
       claimedAt: replacement?.takeoverAt ?? null,
       replacedBy: record.replacedBy,
@@ -83,19 +87,52 @@ export class VoiceOwnershipTracker {
       hadInput,
       hadOutput,
     }
+    this.superseded = superseded
+    this.pendingFlush = superseded
+    return record
+  }
+
+  /**
+   * The other half of the deactivate: called from ws.send()'s completion
+   * callback for the `voice.deactivated` frame. Unlike the callback above this
+   * one really can be seconds late, so it is where a server-side stall shows.
+   */
+  noteDeactivateFlushed(descriptor, { error = null } = {}) {
+    const superseded = this.pendingFlush
+    if (!superseded) return null
+    this.pendingFlush = null
+    const record = deactivateFlushedRecord({
+      descriptor,
+      superseded,
+      flushedAt: this.now(),
+      error,
+    })
+    const late = this.lingerWarnMs > 0
+      && record.flushLatencyMs !== null
+      && record.flushLatencyMs >= this.lingerWarnMs
+    const emit = late || error ? this.logger.warn : this.logger.info
+    emit.call(
+      this.logger,
+      'voice_ownership.deactivate_flushed',
+      record,
+      late
+        ? `voice.deactivated 帧在仲裁后 ${record.flushLatencyMs} 毫秒才写出`
+        : '',
+    )
     return record
   }
 
   /**
    * Boundary B when this connection had been superseded. Idempotent: the
-   * gateway releases on both mute and close, and only the first one after an
-   * eviction closes the window.
+   * gateway releases on close, on mute and when a client drops to text-only,
+   * and only the first one after an eviction closes the window — `reason`
+   * records which, so nobody reads a mute as a socket close.
    */
-  release(client, descriptor) {
+  release(client, descriptor, { reason = 'unspecified' } = {}) {
     const released = this.clients.release(this.ownerId, client)
     this.logger.info(
       'voice_ownership.released',
-      releaseRecord({ descriptor, wasOwner: released }),
+      { ...releaseRecord({ descriptor, wasOwner: released }), reason },
     )
     const superseded = this.superseded
     if (!superseded) return released
@@ -103,7 +140,8 @@ export class VoiceOwnershipTracker {
     const record = supersedeSettledRecord({
       descriptor,
       superseded,
-      closedAt: this.now(),
+      releasedAt: this.now(),
+      releaseReason: reason,
     })
     // A superseded connection that lingers is the ESS-974 failure shape, so it
     // must surface without anyone knowing to grep for it.
@@ -113,10 +151,11 @@ export class VoiceOwnershipTracker {
     const emit = late ? this.logger.warn : this.logger.info
     emit.call(
       this.logger,
-      'voice_ownership.superseded_closed',
+      'voice_ownership.superseded_released',
       record,
       late
-        ? `被替换的连接在失去所有权 ${record.supersededLingerMs} 毫秒后才关闭`
+        ? `被替换的连接在失去所有权 ${record.supersededLingerMs} 毫秒后`
+          + `才释放（reason=${reason}）`
         : '',
     )
     return released
