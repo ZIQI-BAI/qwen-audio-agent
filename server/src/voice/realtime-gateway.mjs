@@ -22,6 +22,11 @@ import { recordTaskResult } from '../conversation/task-result-projector.mjs'
 import { ToolCallHandler } from './tools/tool-call-handler.mjs'
 import { TurnTranscripts } from './tools/turn-transcripts.mjs'
 import { TurnCorrelation } from './turn-correlation.mjs'
+import {
+  claimRecord,
+  deactivationRecord,
+  releaseRecord,
+} from './voice-ownership-log.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
 import {
   ensureResponseContext,
@@ -348,6 +353,15 @@ export function attachRealtimeGateway(server, {
       // a clean close, so a stale holder never blocks a new voice claim.
       isAlive: () => ws.readyState === WebSocket.OPEN,
       deactivate: replacement => {
+        // Logged from the evicted side. `elapsedSinceClaimMs` is the gap
+        // between the newcomer winning arbitration and this socket actually
+        // tearing down — the 5.5s ESS-974 could measure but not attribute.
+        connectionLogger.info('voice_ownership.deactivated', deactivationRecord({
+          descriptor,
+          replacement,
+          hadInput: inputEnabled,
+          hadOutput: outputEnabled,
+        }))
         sleeping = false
         waking = false
         sleepController?.disable()
@@ -373,6 +387,11 @@ export function attachRealtimeGateway(server, {
       enableInput = true,
       enableOutput = true,
     } = {}) => {
+      const incumbent = activeVoiceClients.active(ownerId)
+      // Stamped before arbitration so the evicted socket's deactivate() can
+      // correlate itself to this exact claim and report the delay.
+      voiceClient.takeoverId = `vto_${randomUUID()}`
+      voiceClient.takeoverAt = Date.now()
       const result = activeVoiceClients.activate(
         ownerId,
         voiceClient,
@@ -380,17 +399,32 @@ export function attachRealtimeGateway(server, {
       )
       inputEnabled = result.granted && enableInput
       outputEnabled = result.granted && enableOutput
+      connectionLogger.info('voice_ownership.claim', claimRecord({
+        takeoverId: voiceClient.takeoverId,
+        takeover,
+        result: { ...result, self: voiceClient },
+        incumbent,
+        claimantDescriptor: descriptor,
+        enableInput,
+        enableOutput,
+      }))
       broadcastVoiceOwnership(ownerId)
       return result.granted
     }
     const releaseVoiceClient = () => {
       inputEnabled = false
       outputEnabled = false
-      if (activeVoiceClients.release(ownerId, voiceClient)) {
+      const released = activeVoiceClients.release(ownerId, voiceClient)
+      connectionLogger.info(
+        'voice_ownership.released',
+        releaseRecord({ descriptor, wasOwner: released }),
+      )
+      if (released) {
         broadcastVoiceOwnership(ownerId)
       }
     }
     const toolCalls = new ToolCallHandler({
+      logger: connectionLogger,
       taskManager,
       ownerId,
       sessionId,
@@ -768,6 +802,14 @@ export function attachRealtimeGateway(server, {
       }
       if (!context.responseStarted) {
         context.responseStarted = true
+        connectionLogger.info('response.started', {
+          responseId: id,
+          turnId: context.turnId || null,
+          turnGeneration: context.turnGeneration ?? null,
+          origin: context.origin || 'model',
+          taskIds: contextTaskIds(context),
+          authorizationId: context.authorizationId || null,
+        })
         send(ws, {
           type: 'response.started',
           responseId: id,
@@ -1241,11 +1283,32 @@ export function attachRealtimeGateway(server, {
         const responseFailed = ['failed', 'cancelled', 'incomplete'].includes(
           responseStatus,
         )
+        // Each disjunct is logged separately: the combined boolean is what made
+        // ESS-977 mis-attributable, because "suppressed" could not be traced
+        // back to which of the four conditions actually fired.
+        const suppressParts = {
+          responseFailed,
+          contextSuppressed: Boolean(responseContext?.suppressed),
+          hasAudio: Boolean(responseContext?.hasAudio),
+          hasTranscript: Boolean(responseContext?.assistantTranscript?.trim()),
+        }
+        const suppressResponse = Object.values(suppressParts).some(Boolean)
+        connectionLogger.info('response.done', {
+          responseId: id,
+          turnId: responseTurnId,
+          turnGeneration: responseContext?.turnGeneration ?? null,
+          origin: responseContext?.origin || 'model',
+          status: responseStatus || null,
+          hasFunctionCall: Boolean(responseContext?.hasFunctionCall),
+          taskIds: contextTaskIds(responseContext || {}),
+          suppressResponse,
+          suppressParts,
+          // Absent context means response.done arrived for a response we never
+          // tracked — silently treated as unsuppressed everywhere downstream.
+          contextKnown: Boolean(responseContext),
+        })
         toolCalls.finishToolResponse(id, {
-          suppressResponse: responseFailed
-            || Boolean(responseContext?.suppressed)
-            || Boolean(responseContext?.hasAudio)
-            || Boolean(responseContext?.assistantTranscript?.trim()),
+          suppressResponse,
         }).catch(error => {
           send(ws, { type: 'error', message: error.message })
         })

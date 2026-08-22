@@ -419,6 +419,20 @@ export const config = {
     2,
     { min: 1, max: 16 },
   ),
+  // How long one holder may occupy a lane before blocked-start records
+  // escalate from info to warn. Purely a logging threshold: it never aborts
+  // or releases anything.
+  taskLaneStuckWarnMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_TASK_LANE_STUCK_WARN_MS,
+    3_600_000,
+    { min: 60_000 },
+  ),
+  // Interval for the periodic occupied-lane snapshot. 0 disables it.
+  taskLaneSnapshotMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_TASK_LANE_SNAPSHOT_MS,
+    300_000,
+    { min: 0 },
+  ),
   conversationSessionTtlMs: numberSetting(
     process.env.QWEN_AUDIO_AGENT_SESSION_TTL_MS,
     21_600_000,
