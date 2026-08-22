@@ -364,6 +364,120 @@ test('retries an empty ACP coordinator response in a fresh Session', async () =>
   await adapter.close()
 })
 
+test('replaces a poisoned coordinator Session after provider 400', async () => {
+  const prompts = []
+  let nextSession = 0
+  const client = {
+    async newSession(options) {
+      return {
+        sessionId: `coordinator-${++nextSession}`,
+        cwd: options.cwd,
+        response: {},
+      }
+    },
+    async prompt(sessionId) {
+      prompts.push(sessionId)
+      if (prompts.length === 1) {
+        const error = new Error('Responses API 400')
+        error.body = JSON.stringify({
+          error: { code: 'invalid_id_prefix', message: 'invalid item id' },
+        })
+        throw error
+      }
+      return {
+        content: completed('新 Session 已自愈'),
+        response: { stopReason: 'end_turn' },
+      }
+    },
+    async close() {},
+  }
+  const adapter = new AcpBackendAdapter({
+    protocol: 'codex',
+    directory: '/coordinator',
+    client,
+  })
+
+  const result = await adapter.runCoordinator('杭州天气', {
+    ownerId: 'owner-one',
+    coordinationRunId: 'work-one',
+  })
+
+  assert.deepEqual(prompts, ['coordinator-1', 'coordinator-2'])
+  assert.equal(JSON.parse(result.content).presentation.speech, '新 Session 已自愈')
+  await adapter.close()
+})
+
+test('fails after one fresh Session when structured provider errors persist', async () => {
+  let nextSession = 0
+  const rawError = JSON.stringify({
+    error: { code: 'invalid_id_prefix', message: 'provider internals' },
+  })
+  const client = {
+    async newSession(options) {
+      return {
+        sessionId: `coordinator-${++nextSession}`,
+        cwd: options.cwd,
+        response: {},
+      }
+    },
+    async prompt() {
+      return { content: rawError, response: { stopReason: 'end_turn' } }
+    },
+    async close() {},
+  }
+  const adapter = new AcpBackendAdapter({
+    protocol: 'codex',
+    directory: '/coordinator',
+    client,
+  })
+
+  await assert.rejects(
+    adapter.runCoordinator('杭州天气', {
+      ownerId: 'owner-one',
+      coordinationRunId: 'work-one',
+    }),
+    error => {
+      assert.match(error.message, /服务返回失败/)
+      assert.equal(error.message.includes(rawError), false)
+      return true
+    },
+  )
+  assert.equal(nextSession, 2)
+  await adapter.close()
+})
+
+test('maps abnormal ACP stop reasons to a failed terminal result', async () => {
+  let nextSession = 0
+  const client = {
+    async newSession(options) {
+      return {
+        sessionId: `coordinator-${++nextSession}`,
+        cwd: options.cwd,
+        response: {},
+      }
+    },
+    async prompt() {
+      return { content: 'partial output', response: { stopReason: 'max_tokens' } }
+    },
+    async close() {},
+  }
+  const adapter = new AcpBackendAdapter({
+    protocol: 'codex',
+    directory: '/coordinator',
+    client,
+  })
+
+  await assert.rejects(
+    adapter.runCoordinator('杭州天气', {
+      ownerId: 'owner-one',
+      coordinationRunId: 'work-one',
+    }),
+    /未能完成请求（max_tokens）/,
+  )
+  assert.equal(nextSession, 2)
+  await adapter.close()
+})
+
 test('retries an OpenClaw reply initialization conflict in the same Session', async () => {
   const prompts = []
   let nextSession = 0

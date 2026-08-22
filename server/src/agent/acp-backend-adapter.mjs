@@ -75,6 +75,57 @@ function bounded(value, max = 300) {
   return clean(value).replace(/\s+/g, ' ').slice(0, max)
 }
 
+function jsonObject(value) {
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function errorFacts(value, facts = []) {
+  if (!value || facts.length > 100) return facts
+  if (typeof value === 'string') {
+    facts.push(value)
+    const parsed = jsonObject(value)
+    if (parsed) errorFacts(parsed, facts)
+    return facts
+  }
+  if (typeof value !== 'object') {
+    facts.push(String(value))
+    return facts
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (['status', 'statusCode', 'code', 'type', 'message', 'error'].includes(key)) {
+      if (typeof entry !== 'object') facts.push(String(entry))
+    }
+    errorFacts(entry, facts)
+  }
+  return facts
+}
+
+function isUnrecoverableProvider4xx(error) {
+  const facts = errorFacts({
+    status: error?.status,
+    message: error?.message,
+    body: error?.body,
+    data: error?.data,
+  })
+  return facts.some(value => /\b4\d\d\b/.test(value))
+    || facts.some(value => /invalid[_ -]?id[_ -]?prefix/i.test(value))
+}
+
+function structuredProviderError(content) {
+  const payload = jsonObject(content)
+  if (!payload) return null
+  const state = clean(payload.state || payload.status).toLowerCase()
+  const stopReason = clean(payload.stopReason || payload.stop_reason).toLowerCase()
+  if (!payload.error && !['error', 'failed', 'failure'].includes(state)
+    && !['error', 'failed', 'failure'].includes(stopReason)) return null
+  return payload
+}
+
 function optionValues(entries = []) {
   return optionChoices(entries).map(entry => entry.value)
 }
@@ -972,6 +1023,13 @@ export class AcpBackendAdapter {
           },
         )
       } catch (error) {
+        if (isUnrecoverableProvider4xx(error)) {
+          error.recoverWithFreshCoordinator = !run.receivedUpdate
+            && !run.delegation
+            && run.nativeToolCalls.size === 0
+            && run.toolCalls.size === 0
+          throw error
+        }
         const retryIsSafe = !run.receivedUpdate
           && !run.delegation
           && run.nativeToolCalls.size === 0
@@ -1048,6 +1106,21 @@ export class AcpBackendAdapter {
         signal,
         onUpdate: update => this.onSessionUpdate(run, update),
       })
+      const stopReason = clean(result?.response?.stopReason).toLowerCase()
+      const providerError = structuredProviderError(result?.content)
+      if (providerError || (stopReason && stopReason !== 'end_turn')) {
+        const error = new AgentError(
+          providerError
+            ? `${this.profile.label} 服务返回失败，请稍后重试。`
+            : `${this.profile.label} 未能完成请求（${bounded(stopReason)}），请稍后重试。`,
+          { status: 502, protocol: this.protocol },
+        )
+        error.recoverWithFreshCoordinator = !run.receivedUpdate
+          && !run.delegation
+          && run.nativeToolCalls.size === 0
+          && run.toolCalls.size === 0
+        throw error
+      }
       if (!clean(result?.content)) {
         const error = new AgentError(
           `${this.profile.label} ACP Session 未返回任何内容`,
