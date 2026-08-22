@@ -22,6 +22,7 @@ import { recordTaskResult } from '../conversation/task-result-projector.mjs'
 import { ToolCallHandler } from './tools/tool-call-handler.mjs'
 import { TurnTranscripts } from './tools/turn-transcripts.mjs'
 import { TurnCorrelation } from './turn-correlation.mjs'
+import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
 import {
   ensureResponseContext,
@@ -58,8 +59,18 @@ const PERMISSION_RESPONSE_GRACE_MS = 800
 const RESPONSE_CONTEXT_CLEANUP_MS = 30000
 const REALTIME_STABLE_CONNECTION_MS = 10000
 
-function send(ws, event) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event))
+/**
+ * `onFlush` is invoked once the frame has been written out (ws.send's own
+ * completion callback), or immediately with an error when the socket is not
+ * open. Only the deactivate path uses it: everywhere else the write completion
+ * carries no information worth a callback.
+ */
+function send(ws, event, onFlush) {
+  if (ws.readyState !== WebSocket.OPEN) {
+    onFlush?.(new Error('socket_not_open'))
+    return
+  }
+  ws.send(JSON.stringify(event), onFlush)
 }
 
 function rejectUpgrade(socket, status, message) {
@@ -309,6 +320,14 @@ export function attachRealtimeGateway(server, {
         message: `后台结果暂时无法播报，正在自动重试：${error.message}`,
       }),
     })
+    // Shares the process-wide registry, so trackers on different connections
+    // arbitrate against each other exactly as the sockets do.
+    const ownership = new VoiceOwnershipTracker({
+      clients: activeVoiceClients,
+      ownerId,
+      logger: connectionLogger,
+      lingerWarnMs: config.voiceSupersedeLingerWarnMs,
+    })
     const voiceClient = {
       ws,
       descriptor,
@@ -348,6 +367,13 @@ export function attachRealtimeGateway(server, {
       // a clean close, so a stale holder never blocks a new voice claim.
       isAlive: () => ws.readyState === WebSocket.OPEN,
       deactivate: replacement => {
+        // Logged from the evicted side, inline inside the newcomer's claim.
+        // The wall-clock gap ESS-974 cares about is not measurable here — it
+        // closes when this socket actually goes away, in ownership.release().
+        ownership.noteSupersede(descriptor, replacement, {
+          hadInput: inputEnabled,
+          hadOutput: outputEnabled,
+        })
         sleeping = false
         waking = false
         sleepController?.disable()
@@ -359,38 +385,37 @@ export function attachRealtimeGateway(server, {
         cancelScheduledRealtimeReconnect()
         frontend?.close()
         send(ws, { type: 'playback.clear' })
+        // The write completion is the only deactivate-side event that can be
+        // late: it is where a server-side stall would show up, separately from
+        // how long this connection then lingers.
         send(ws, {
           type: 'voice.deactivated',
           holder: replacement?.descriptor || null,
-        })
+        }, error => ownership.noteDeactivateFlushed(descriptor, { error }))
       },
     }
     if (!voiceConnections.has(ownerId)) voiceConnections.set(ownerId, new Set())
     voiceConnections.get(ownerId).add(voiceClient)
 
-    const activateVoiceClient = ({
-      takeover = false,
-      enableInput = true,
-      enableOutput = true,
-    } = {}) => {
-      const result = activeVoiceClients.activate(
-        ownerId,
-        voiceClient,
-        { takeover },
-      )
-      inputEnabled = result.granted && enableInput
-      outputEnabled = result.granted && enableOutput
+    const activateVoiceClient = (options = {}) => {
+      const result = ownership.claim(voiceClient, descriptor, options)
+      inputEnabled = result.granted && options.enableInput !== false
+      outputEnabled = result.granted && options.enableOutput !== false
       broadcastVoiceOwnership(ownerId)
       return result.granted
     }
-    const releaseVoiceClient = () => {
+    // `reason` distinguishes the three ways a connection gives the slot up —
+    // they are different claims about the socket's lifetime and must not be
+    // logged as if they were one.
+    const releaseVoiceClient = (reason = 'unspecified') => {
       inputEnabled = false
       outputEnabled = false
-      if (activeVoiceClients.release(ownerId, voiceClient)) {
+      if (ownership.release(voiceClient, descriptor, { reason })) {
         broadcastVoiceOwnership(ownerId)
       }
     }
     const toolCalls = new ToolCallHandler({
+      logger: connectionLogger,
       taskManager,
       ownerId,
       sessionId,
@@ -768,6 +793,14 @@ export function attachRealtimeGateway(server, {
       }
       if (!context.responseStarted) {
         context.responseStarted = true
+        connectionLogger.info('response.started', {
+          responseId: id,
+          turnId: context.turnId || null,
+          turnGeneration: context.turnGeneration ?? null,
+          origin: context.origin || 'model',
+          taskIds: contextTaskIds(context),
+          authorizationId: context.authorizationId || null,
+        })
         send(ws, {
           type: 'response.started',
           responseId: id,
@@ -1241,11 +1274,32 @@ export function attachRealtimeGateway(server, {
         const responseFailed = ['failed', 'cancelled', 'incomplete'].includes(
           responseStatus,
         )
+        // Each disjunct is logged separately: the combined boolean is what made
+        // ESS-977 mis-attributable, because "suppressed" could not be traced
+        // back to which of the four conditions actually fired.
+        const suppressParts = {
+          responseFailed,
+          contextSuppressed: Boolean(responseContext?.suppressed),
+          hasAudio: Boolean(responseContext?.hasAudio),
+          hasTranscript: Boolean(responseContext?.assistantTranscript?.trim()),
+        }
+        const suppressResponse = Object.values(suppressParts).some(Boolean)
+        connectionLogger.info('response.done', {
+          responseId: id,
+          turnId: responseTurnId,
+          turnGeneration: responseContext?.turnGeneration ?? null,
+          origin: responseContext?.origin || 'model',
+          status: responseStatus || null,
+          hasFunctionCall: Boolean(responseContext?.hasFunctionCall),
+          taskIds: contextTaskIds(responseContext || {}),
+          suppressResponse,
+          suppressParts,
+          // Absent context means response.done arrived for a response we never
+          // tracked — silently treated as unsuppressed everywhere downstream.
+          contextKnown: Boolean(responseContext),
+        })
         toolCalls.finishToolResponse(id, {
-          suppressResponse: responseFailed
-            || Boolean(responseContext?.suppressed)
-            || Boolean(responseContext?.hasAudio)
-            || Boolean(responseContext?.assistantTranscript?.trim()),
+          suppressResponse,
         }).catch(error => {
           send(ws, { type: 'error', message: error.message })
         })
@@ -1925,7 +1979,7 @@ export function attachRealtimeGateway(server, {
             enableOutput: capabilities.outputEnabled,
           })
         } else {
-          releaseVoiceClient()
+          releaseVoiceClient('text_only')
           inputEnabled = capabilities.inputEnabled
           outputEnabled = capabilities.outputEnabled
           broadcastVoiceOwnership(ownerId)
@@ -2093,7 +2147,7 @@ export function attachRealtimeGateway(server, {
         }
       } else if (event.type === GatewayClientEvent.MUTE) {
         explicitSleepRequested = false
-        releaseVoiceClient()
+        releaseVoiceClient('mute')
         sleeping = false
         waking = false
         sleepController?.disable()
@@ -2126,7 +2180,7 @@ export function attachRealtimeGateway(server, {
       connectionLogger.info('voice_client.disconnected', {
         clientType: descriptor.type,
       })
-      releaseVoiceClient()
+      releaseVoiceClient('socket_closed')
       const connections = voiceConnections.get(ownerId)
       connections?.delete(voiceClient)
       if (!connections?.size) voiceConnections.delete(ownerId)

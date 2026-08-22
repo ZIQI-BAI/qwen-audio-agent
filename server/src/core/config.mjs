@@ -419,6 +419,32 @@ export const config = {
     2,
     { min: 1, max: 16 },
   ),
+  // How long one holder may occupy a lane before blocked-start records
+  // escalate from info to warn. Purely a logging threshold: it never aborts
+  // or releases anything.
+  taskLaneStuckWarnMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_TASK_LANE_STUCK_WARN_MS,
+    3_600_000,
+    { min: 60_000 },
+  ),
+  // Interval for the periodic occupied-lane snapshot. 0 disables it.
+  taskLaneSnapshotMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_TASK_LANE_SNAPSHOT_MS,
+    300_000,
+    { min: 0 },
+  ),
+  // Shared warn threshold for both halves of a takeover: a connection that
+  // lost voice ownership but has not released past this many milliseconds
+  // escalates its `voice_ownership.superseded_released` record, and so does a
+  // `voice.deactivated` frame that takes this long to write out
+  // (`voice_ownership.deactivate_flushed`). Those two windows are where
+  // ESS-974's 5.53s could be hiding. 0 disables the escalation; both records
+  // are always written.
+  voiceSupersedeLingerWarnMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_VOICE_SUPERSEDE_LINGER_WARN_MS,
+    1_000,
+    { min: 0 },
+  ),
   conversationSessionTtlMs: numberSetting(
     process.env.QWEN_AUDIO_AGENT_SESSION_TTL_MS,
     21_600_000,

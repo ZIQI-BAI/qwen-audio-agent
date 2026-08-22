@@ -109,6 +109,7 @@ export class TaskManager {
     notificationClaimTtlMs = 60_000,
     maxTerminalTasksPerOwner = 100,
     progressCheckMs = config.backgroundTaskProgressCheckMs,
+    laneStuckWarnMs = config.taskLaneStuckWarnMs,
     logger: taskLogger = null,
   } = {}) {
     this.runner = runner
@@ -122,6 +123,8 @@ export class TaskManager {
     this.notificationClaimTtlMs = notificationClaimTtlMs
     this.maxTerminalTasksPerOwner = maxTerminalTasksPerOwner
     this.progressCheckMs = Math.max(0, Number(progressCheckMs) || 0)
+    this.laneStuckWarnMs = Math.max(0, Number(laneStuckWarnMs) || 0)
+      || 3_600_000
     this.logger = taskLogger
     this.tasks = new Map()
     this.listeners = new Set()
@@ -134,6 +137,50 @@ export class TaskManager {
   configureRetention(options = {}) {
     Object.assign(this, options)
     this.prune()
+  }
+
+  /**
+   * Periodic record of every occupied lane. Without it a lane that jams while
+   * nothing new is queued produces no evidence at all — ESS-977 sat unobserved
+   * for 183 hours precisely because silence looked identical to health.
+   * Opt-in so tests never inherit a live timer.
+   */
+  startLaneSnapshots(intervalMs = config.taskLaneSnapshotMs) {
+    this.stopLaneSnapshots()
+    const interval = Math.max(0, Number(intervalMs) || 0)
+    if (!interval || !this.logger) return null
+    this.laneSnapshotTimer = setInterval(() => {
+      const now = Date.now()
+      const lanes = this.scheduler.laneSnapshot(now)
+      if (!lanes.length) return
+      const stuck = lanes.filter(
+        lane => lane.longestHeldMs >= this.laneStuckWarnMs,
+      )
+      const emit = stuck.length ? this.logger.warn : this.logger.info
+      emit('task.lane_snapshot', {
+        lanes,
+        laneCount: lanes.length,
+        stuckLaneCount: stuck.length,
+        queuedCount: this.count('queued'),
+        activeCount: this.scheduler.active.size,
+      })
+    }, interval)
+    this.laneSnapshotTimer.unref?.()
+    return this.laneSnapshotTimer
+  }
+
+  stopLaneSnapshots() {
+    if (!this.laneSnapshotTimer) return
+    clearInterval(this.laneSnapshotTimer)
+    this.laneSnapshotTimer = null
+  }
+
+  count(status) {
+    let total = 0
+    for (const task of this.tasks.values()) {
+      if (task.status === status) total += 1
+    }
+    return total
   }
 
   configureScheduledTaskRunner(runner) {
@@ -303,6 +350,7 @@ export class TaskManager {
     }
     const log = [
       'task.scheduled',
+      'task.accepted',
       'task.created',
       'task.running',
       'task.delegated',
@@ -319,6 +367,13 @@ export class TaskManager {
       turnId: task.turnId,
       kind: task.kind || 'work',
       status: task.status,
+      // Lane identity travels with every transition so `grep <laneKey>` alone
+      // reconstructs who entered and left a contended lane, and when.
+      laneKey: task.laneKey || null,
+      laneLimit: task.laneKey ? task.laneLimit : null,
+      startedAt: task.startedAt
+        ? new Date(task.startedAt).toISOString()
+        : null,
       elapsedMs: task.elapsedMs,
       hasError: Boolean(task.error),
     })
@@ -469,10 +524,62 @@ export class TaskManager {
         Number(right.priority || 0) - Number(left.priority || 0)
         || left.createdAt - right.createdAt
       ))
+    const now = Date.now()
     for (const task of queued) {
-      if (!this.scheduler.canStart(task)) continue
+      const decision = this.scheduler.explain(task, now)
+      if (!decision.allowed) {
+        this.logStartBlocked(task, decision, now)
+        continue
+      }
+      task.blockedSignature = null
       this.start(task)
     }
+  }
+
+  /**
+   * drain() runs on every task transition, so an unconditional record per
+   * rejection would bury the signal. Log at info when a task's blocked state
+   * actually changes (first refusal, or a different holder took over), at warn
+   * once a holder crosses the stuck threshold, and at debug for the repeats.
+   */
+  logStartBlocked(task, decision, now) {
+    const holders = decision.holders || []
+    const longestHeldMs = holders.reduce(
+      (longest, holder) => Math.max(longest, holder.heldMs || 0),
+      0,
+    )
+    const stuck = longestHeldMs >= this.laneStuckWarnMs
+    const signature = [
+      decision.reason,
+      ...holders.map(holder => holder.taskId),
+      stuck ? 'stuck' : '',
+    ].join('|')
+    const changed = task.blockedSignature !== signature
+    task.blockedSignature = signature
+    const emit = stuck && changed
+      ? this.logger?.warn
+      : (changed ? this.logger?.info : this.logger?.debug)
+    emit?.('task.start_blocked', {
+      taskId: task.id,
+      ownerId: task.ownerId,
+      sessionId: task.sessionId,
+      turnId: task.turnId,
+      kind: task.kind || 'work',
+      objective: String(task.objective || '').slice(0, 80),
+      // `reason` names the exact constraint that refused; `holders` names who
+      // is sitting in the slot and for how long. Together they answer
+      // "车道被谁占死、占了多久" without curling the internal task API.
+      reason: decision.reason,
+      laneKey: decision.laneKey ?? task.laneKey ?? null,
+      current: decision.current,
+      limit: decision.limit,
+      holders,
+      longestHeldMs,
+      queuedMs: now - task.createdAt,
+    }, stuck
+      ? `任务已排队 ${Math.round((now - task.createdAt) / 60000)} 分钟，`
+        + `占用方已持有 ${Math.round(longestHeldMs / 3_600_000)} 小时`
+      : '')
   }
 
   start(task) {
@@ -988,3 +1095,5 @@ export const taskManager = new TaskManager({
   pendingNotificationTtlMs: config.taskPendingNotificationTtlMs,
   maxTerminalTasksPerOwner: config.maxTerminalTasksPerOwner,
 })
+
+taskManager.startLaneSnapshots()

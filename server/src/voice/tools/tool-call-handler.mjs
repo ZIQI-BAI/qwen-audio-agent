@@ -64,7 +64,9 @@ export class ToolCallHandler {
     onPermissionDeliveryFailed = () => {},
     requestClientState = () => {},
     inputAssets = null,
+    logger = null,
   }) {
+    this.logger = logger
     this.taskManager = taskManager
     this.ownerId = ownerId
     this.sessionId = sessionId
@@ -140,16 +142,52 @@ export class ToolCallHandler {
   async finishToolResponse(responseId, { suppressResponse = false } = {}) {
     const key = String(responseId || '')
     const batch = this.deferredToolResponses.get(key)
-    if (!batch) return
+    if (!batch) {
+      // No deferred batch means suppressResponse is never consulted for this
+      // response at all. ESS-977 mistook this path for an active suppression.
+      this.logger?.debug('tool_response.flush', {
+        responseId: key,
+        outcome: 'no_deferred_batch',
+        ensureResponseCalled: false,
+        suppressResponse,
+      })
+      return
+    }
     batch.sourceDone = true
     batch.suppressResponse ||= suppressResponse
     await this.flushDeferredToolResponse(key, batch)
   }
 
+  /**
+   * Three exits, and only one of them asks the model to speak. Which exit was
+   * taken is exactly the fact ESS-977 needed and could not obtain, so every
+   * branch names itself before returning.
+   */
   async flushDeferredToolResponse(responseId, batch) {
-    if (!batch.sourceDone || batch.pending > 0) return
+    const record = outcome => this.logger?.info(
+      'tool_response.flush',
+      {
+        responseId,
+        turnId: batch.turnId || null,
+        turnGeneration: batch.turnGeneration ?? null,
+        outcome,
+        ensureResponseCalled: outcome === 'ensure_response',
+        pending: batch.pending,
+        sourceDone: batch.sourceDone,
+        failed: batch.failed,
+        suppressResponse: batch.suppressResponse,
+      },
+    )
+    if (!batch.sourceDone || batch.pending > 0) {
+      record(batch.sourceDone ? 'waiting_pending_calls' : 'waiting_source_done')
+      return
+    }
     this.deferredToolResponses.delete(responseId)
-    if (batch.failed || batch.suppressResponse) return
+    if (batch.failed || batch.suppressResponse) {
+      record(batch.failed ? 'skipped_failed' : 'skipped_suppressed')
+      return
+    }
+    record('ensure_response')
     await this.getFrontend()?.ensureResponse?.({
       turnId: batch.turnId,
       turnGeneration: batch.turnGeneration,
