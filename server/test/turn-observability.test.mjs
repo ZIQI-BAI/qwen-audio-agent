@@ -345,7 +345,7 @@ test('a window closed by mute says mute, not socket close', () => {
   assert.equal('closedAt' in settled[0], false)
   // The release records themselves still name every hand-back.
   assert.deepEqual(
-    logger.find('voice_ownership.released').map(record => record.reason),
+    logger.find('voice_ownership.released').map(record => record.releaseReason),
     ['mute', 'socket_closed'],
   )
 })

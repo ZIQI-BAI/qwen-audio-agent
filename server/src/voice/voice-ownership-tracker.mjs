@@ -130,9 +130,11 @@ export class VoiceOwnershipTracker {
    */
   release(client, descriptor, { reason = 'unspecified' } = {}) {
     const released = this.clients.release(this.ownerId, client)
+    // Same key as supersedeSettledRecord's, so one `releaseReason=` grep
+    // catches both halves of a release rather than only the plain one.
     this.logger.info(
       'voice_ownership.released',
-      { ...releaseRecord({ descriptor, wasOwner: released }), reason },
+      { ...releaseRecord({ descriptor, wasOwner: released }), releaseReason: reason },
     )
     const superseded = this.superseded
     if (!superseded) return released

@@ -433,10 +433,13 @@ export const config = {
     300_000,
     { min: 0 },
   ),
-  // A connection that lost voice ownership but is still open past this many
-  // milliseconds gets its `voice_ownership.superseded_closed` record escalated
-  // to warn — that lingering window is where ESS-974's late deactivate landed.
-  // 0 disables the escalation; the record itself is always written.
+  // Shared warn threshold for both halves of a takeover: a connection that
+  // lost voice ownership but has not released past this many milliseconds
+  // escalates its `voice_ownership.superseded_released` record, and so does a
+  // `voice.deactivated` frame that takes this long to write out
+  // (`voice_ownership.deactivate_flushed`). Those two windows are where
+  // ESS-974's 5.53s could be hiding. 0 disables the escalation; both records
+  // are always written.
   voiceSupersedeLingerWarnMs: numberSetting(
     process.env.QWEN_AUDIO_AGENT_VOICE_SUPERSEDE_LINGER_WARN_MS,
     1_000,
