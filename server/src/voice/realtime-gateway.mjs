@@ -111,6 +111,71 @@ export function acceptsPlaybackReceipt({
   return outputEnabled === true && active === true && responseKnown === true
 }
 
+const PUBLIC_RESPONSE_ORIGINS = new Set([
+  'model',
+  'agent',
+  'announcement',
+  'permission',
+])
+
+export function publicResponseDoneEvent({
+  responseId,
+  context = {},
+  status,
+} = {}) {
+  const id = String(responseId || '').trim()
+  if (!id) return null
+  const origin = PUBLIC_RESPONSE_ORIGINS.has(context.origin)
+    ? context.origin
+    : 'model'
+  const normalizedStatus = typeof status === 'string' && status.trim()
+    ? status.trim()
+    : null
+  const taskIds = Array.isArray(context.taskIds)
+    ? context.taskIds.map(value => String(value || '').trim()).filter(Boolean)
+    : []
+  const taskId = String(context.taskId || '').trim() || null
+  return {
+    type: GatewayServerEvent.RESPONSE_DONE,
+    responseId: id,
+    origin,
+    status: normalizedStatus,
+    hasFunctionCall: context.hasFunctionCall === true,
+    turnId: String(context.turnId || '').trim() || null,
+    taskId,
+    taskIds: taskIds.length ? taskIds : taskId ? [taskId] : [],
+    ...(Number.isInteger(context.turnGeneration)
+      ? { turnGeneration: context.turnGeneration }
+      : {}),
+    // Keep the OpenAI-compatible identity/status envelope while the gateway
+    // dialect's correlation fields remain flat like response.started.
+    response: { id, status: normalizedStatus },
+  }
+}
+
+export function shouldSuppressDeferredToolResponse({
+  responseFailed = false,
+  context = {},
+  responseTurnId = '',
+  currentTurnId = '',
+  currentTurnGeneration = -1,
+} = {}) {
+  const belongsToCurrentTurn = (
+    context.hasFunctionCall === true
+    && context.origin !== 'announcement'
+    && Boolean(responseTurnId)
+    && responseTurnId === currentTurnId
+    && Number.isInteger(context.turnGeneration)
+    && context.turnGeneration === currentTurnGeneration
+  )
+  return responseFailed
+    || Boolean(context.suppressed)
+    || (!belongsToCurrentTurn && (
+      Boolean(context.hasAudio)
+      || Boolean(context.assistantTranscript?.trim())
+    ))
+}
+
 function clientDescriptor(event = {}) {
   const type = ['desktop', 'cli', 'web'].includes(event.clientType)
     ? event.clientType
@@ -1283,7 +1348,15 @@ export function attachRealtimeGateway(server, {
           hasAudio: Boolean(responseContext?.hasAudio),
           hasTranscript: Boolean(responseContext?.assistantTranscript?.trim()),
         }
-        const suppressResponse = Object.values(suppressParts).some(Boolean)
+        const suppressResponse = shouldSuppressDeferredToolResponse({
+          responseFailed,
+          context: responseContext,
+          responseTurnId,
+          currentTurnId: committedTurnId || turnId,
+          currentTurnGeneration: committedTurnId
+            ? committedTurnGeneration
+            : turnGeneration,
+        })
         connectionLogger.info('response.done', {
           responseId: id,
           turnId: responseTurnId,
@@ -1298,6 +1371,12 @@ export function attachRealtimeGateway(server, {
           // tracked — silently treated as unsuppressed everywhere downstream.
           contextKnown: Boolean(responseContext),
         })
+        const responseDoneEvent = publicResponseDoneEvent({
+          responseId: id,
+          context: responseContext,
+          status: responseStatus,
+        })
+        if (responseDoneEvent) send(ws, responseDoneEvent)
         toolCalls.finishToolResponse(id, {
           suppressResponse,
         }).catch(error => {
