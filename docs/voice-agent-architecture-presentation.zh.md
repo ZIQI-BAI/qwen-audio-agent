@@ -406,7 +406,7 @@ style: |
 ## 提交后台
 
 - 需要搜索、工具或文件
-- 通过 `spawn_thinking` 提交异步 Work
+- 通过 `delegate_to_codex` 提交异步 Work
 - 得到任务编号后结束本轮
 - 后台独立继续执行
 
@@ -422,7 +422,7 @@ style: |
 
 ```js
 export const TOOLS = [
-  spawnThinkingTool,          // spawn_thinking：提交异步任务
+  spawnThinkingTool,          // delegate_to_codex：提交异步任务
   scheduleReminderTool,       // schedule_reminder：创建提醒或定时任务
   cancelAgentTaskTool,        // cancel_agent_task：取消后台任务
   getAgentTaskStatusTool,     // get_agent_task_status：查询状态与结果
@@ -446,9 +446,9 @@ export const TOOLS = [
 
 ---
 
-# `spawn_thinking` ：快速受理，不等待结果
+# `delegate_to_codex` ：快速受理，不等待结果
 
-> **`spawn_thinking`** 是实时前台提交异步 Work 的唯一入口：Gateway 返回 `work_id` 后立即结束当前工具回合，后台任务继续独立执行。
+> **`delegate_to_codex`** 是实时前台提交异步 Work 的唯一入口：Gateway 返回 `work_id` 后立即结束当前工具回合，后台任务继续独立执行。
 
 | 步骤 | 系统做什么 | 用户得到什么 |
 | ---: | --- | --- |

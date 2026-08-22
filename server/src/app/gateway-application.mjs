@@ -445,7 +445,7 @@ app.use((error, req, res, next) => {
 
 const server = createServer(app)
 // Receipt-based tool acceptance reads backend availability from this cache
-// instead of probing per spawn_thinking call; the snapshot answers
+// instead of probing per delegate_to_codex call; the snapshot answers
 // synchronously and refreshes itself in the background.
 const backendAvailability = new BackendAvailability({
   probe: async () => {
