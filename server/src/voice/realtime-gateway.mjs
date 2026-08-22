@@ -22,11 +22,7 @@ import { recordTaskResult } from '../conversation/task-result-projector.mjs'
 import { ToolCallHandler } from './tools/tool-call-handler.mjs'
 import { TurnTranscripts } from './tools/turn-transcripts.mjs'
 import { TurnCorrelation } from './turn-correlation.mjs'
-import {
-  claimRecord,
-  deactivationRecord,
-  releaseRecord,
-} from './voice-ownership-log.mjs'
+import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
 import {
   ensureResponseContext,
@@ -314,6 +310,14 @@ export function attachRealtimeGateway(server, {
         message: `后台结果暂时无法播报，正在自动重试：${error.message}`,
       }),
     })
+    // Shares the process-wide registry, so trackers on different connections
+    // arbitrate against each other exactly as the sockets do.
+    const ownership = new VoiceOwnershipTracker({
+      clients: activeVoiceClients,
+      ownerId,
+      logger: connectionLogger,
+      lingerWarnMs: config.voiceSupersedeLingerWarnMs,
+    })
     const voiceClient = {
       ws,
       descriptor,
@@ -353,15 +357,13 @@ export function attachRealtimeGateway(server, {
       // a clean close, so a stale holder never blocks a new voice claim.
       isAlive: () => ws.readyState === WebSocket.OPEN,
       deactivate: replacement => {
-        // Logged from the evicted side. `elapsedSinceClaimMs` is the gap
-        // between the newcomer winning arbitration and this socket actually
-        // tearing down — the 5.5s ESS-974 could measure but not attribute.
-        connectionLogger.info('voice_ownership.deactivated', deactivationRecord({
-          descriptor,
-          replacement,
+        // Logged from the evicted side, inline inside the newcomer's claim.
+        // The wall-clock gap ESS-974 cares about is not measurable here — it
+        // closes when this socket actually goes away, in ownership.release().
+        ownership.noteSupersede(descriptor, replacement, {
           hadInput: inputEnabled,
           hadOutput: outputEnabled,
-        }))
+        })
         sleeping = false
         waking = false
         sleepController?.disable()
@@ -382,44 +384,17 @@ export function attachRealtimeGateway(server, {
     if (!voiceConnections.has(ownerId)) voiceConnections.set(ownerId, new Set())
     voiceConnections.get(ownerId).add(voiceClient)
 
-    const activateVoiceClient = ({
-      takeover = false,
-      enableInput = true,
-      enableOutput = true,
-    } = {}) => {
-      const incumbent = activeVoiceClients.active(ownerId)
-      // Stamped before arbitration so the evicted socket's deactivate() can
-      // correlate itself to this exact claim and report the delay.
-      voiceClient.takeoverId = `vto_${randomUUID()}`
-      voiceClient.takeoverAt = Date.now()
-      const result = activeVoiceClients.activate(
-        ownerId,
-        voiceClient,
-        { takeover },
-      )
-      inputEnabled = result.granted && enableInput
-      outputEnabled = result.granted && enableOutput
-      connectionLogger.info('voice_ownership.claim', claimRecord({
-        takeoverId: voiceClient.takeoverId,
-        takeover,
-        result: { ...result, self: voiceClient },
-        incumbent,
-        claimantDescriptor: descriptor,
-        enableInput,
-        enableOutput,
-      }))
+    const activateVoiceClient = (options = {}) => {
+      const result = ownership.claim(voiceClient, descriptor, options)
+      inputEnabled = result.granted && options.enableInput !== false
+      outputEnabled = result.granted && options.enableOutput !== false
       broadcastVoiceOwnership(ownerId)
       return result.granted
     }
     const releaseVoiceClient = () => {
       inputEnabled = false
       outputEnabled = false
-      const released = activeVoiceClients.release(ownerId, voiceClient)
-      connectionLogger.info(
-        'voice_ownership.released',
-        releaseRecord({ descriptor, wasOwner: released }),
-      )
-      if (released) {
+      if (ownership.release(voiceClient, descriptor)) {
         broadcastVoiceOwnership(ownerId)
       }
     }

@@ -9,9 +9,9 @@ import {
 import { ActiveVoiceClients } from '../src/voice/active-voice-clients.mjs'
 import {
   claimRecord,
-  deactivationRecord,
   releaseRecord,
 } from '../src/voice/voice-ownership-log.mjs'
+import { VoiceOwnershipTracker } from '../src/voice/voice-ownership-tracker.mjs'
 import { ToolCallHandler } from '../src/voice/tools/tool-call-handler.mjs'
 
 const HOUR = 3_600_000
@@ -161,83 +161,168 @@ test('owner concurrency refusal is distinguishable from lane refusal', () => {
 })
 
 // ---------------------------------------------------------------------------
-// ESS-974 replay: the superseded socket deactivates 5.53s after the newcomer
-// won arbitration. The log alone must say which instanceId deactivated.
+// ESS-974 replay: the connection that lost arbitration is still alive 5.53s
+// later. The two boundaries below are both real production events on two
+// different connections, and the test never hands a record builder the delay
+// it expects to read back — it advances a clock between two production calls.
+//
+//   A. voice_ownership.claim            — newcomer wins arbitration
+//   B. voice_ownership.superseded_closed — evicted connection finally closes
+//
+// The synchronous deactivate() callback in between is NOT a boundary:
+// ActiveVoiceClients.activate() invokes it inline, so it can only ever measure
+// in-process arbitration cost. Reporting that as the takeover delay is the
+// defect ESS-992 was filed for.
 // ---------------------------------------------------------------------------
 
-test('ESS-974 replay: deactivation names both instanceIds and the delay', () => {
-  const clients = new ActiveVoiceClients()
-  const records = []
-
-  // Both sockets carry the identical label seen in production; only
-  // instanceId can tell them apart.
-  const makeClient = instanceId => {
-    const client = {
-      descriptor: {
-        instanceId,
-        type: 'web',
-        label: 'watch-direct-gateway',
-      },
-      isAlive: () => true,
-      deactivate(replacement) {
-        records.push({
-          event: 'voice_ownership.deactivated',
-          ...deactivationRecord({
-            descriptor: client.descriptor,
-            replacement,
-            // 5.53s after the claim, as measured in ESS-974.
-            now: replacement.takeoverAt + 5_530,
-            hadInput: true,
-            hadOutput: true,
-          }),
-        })
-      },
-    }
-    return client
+function fakeClock(start = 1_770_000_000_000) {
+  let current = start
+  const now = () => current
+  now.advance = ms => {
+    current += ms
+    return current
   }
+  return now
+}
 
-  const oldSocket = makeClient('inst_old_a1b2')
-  const newSocket = makeClient('inst_new_c3d4')
-
-  clients.activate('user_personal', oldSocket, { takeover: false })
-
-  newSocket.takeoverId = 'vto_test'
-  newSocket.takeoverAt = Date.now()
-  const result = clients.activate('user_personal', newSocket, {
-    takeover: true,
+/**
+ * Mirrors realtime-gateway.mjs's three ownership call sites: claim() on
+ * voice.activate, noteSupersede() from the voiceClient.deactivate callback,
+ * and release() on websocket close.
+ */
+function voiceConnection({ clients, logger, now, instanceId, lingerWarnMs = 1_000 }) {
+  const descriptor = { instanceId, type: 'web', label: 'watch-direct-gateway' }
+  const tracker = new VoiceOwnershipTracker({
+    clients,
+    ownerId: 'user_personal',
+    logger,
+    now,
+    lingerWarnMs,
   })
+  const client = {
+    descriptor,
+    isAlive: () => true,
+    deactivate: replacement => tracker.noteSupersede(descriptor, replacement, {
+      hadInput: true,
+      hadOutput: true,
+    }),
+  }
+  return {
+    descriptor,
+    tracker,
+    claim: (options = {}) => tracker.claim(client, descriptor, options),
+    close: () => tracker.release(client, descriptor),
+  }
+}
 
-  const claim = claimRecord({
-    takeoverId: newSocket.takeoverId,
-    takeover: true,
-    result: { ...result, self: newSocket },
-    incumbent: oldSocket,
-    claimantDescriptor: newSocket.descriptor,
-    enableInput: true,
-    enableOutput: true,
-  })
+test('ESS-974 replay: a superseded connection lingering 5530ms is measured end to end', () => {
+  const logger = recordingLogger()
+  const clients = new ActiveVoiceClients()
+  const now = fakeClock()
+  // Both connections carry the identical production label; only instanceId
+  // tells them apart.
+  const round2 = voiceConnection({ clients, logger, now, instanceId: 'inst_old_a1b2' })
+  const round3 = voiceConnection({ clients, logger, now, instanceId: 'inst_new_c3d4' })
 
-  // The claim side: who took over from whom.
+  round2.claim({ takeover: false })
+  now.advance(30_000)
+  round3.claim({ takeover: true })
+
+  // ESS-974: 02:19:25.089 supersede → 02:19:30.617 the old socket is gone.
+  now.advance(5_530)
+  round2.close()
+
+  const [, claim] = logger.find('voice_ownership.claim')
   assert.equal(claim.granted, true)
   assert.equal(claim.reason, 'took_over')
   assert.equal(claim.claimant.instanceId, 'inst_new_c3d4')
   assert.equal(claim.incumbent.instanceId, 'inst_old_a1b2')
-  assert.equal(claim.incumbentAlive, true)
   assert.equal(claim.evicted.instanceId, 'inst_old_a1b2')
 
-  // The deactivate side: which instanceId went away, and how late.
-  assert.equal(records.length, 1)
-  const [deactivated] = records
-  assert.equal(deactivated.evicted.instanceId, 'inst_old_a1b2')
-  assert.equal(deactivated.replacedBy.instanceId, 'inst_new_c3d4')
-  assert.equal(deactivated.elapsedSinceClaimMs, 5_530)
-  // Correlates the two records without relying on label, which is identical.
-  assert.equal(deactivated.takeoverId, claim.takeoverId)
-  assert.notEqual(
-    deactivated.evicted.instanceId,
-    deactivated.replacedBy.instanceId,
+  // The synchronous callback measures arbitration, and says so: it is 0 even
+  // though the takeover took 5.53s to settle.
+  const [deactivated] = logger.find('voice_ownership.deactivated')
+  assert.equal(deactivated.arbitrationLatencyMs, 0)
+  assert.equal('elapsedSinceClaimMs' in deactivated, false)
+
+  // Boundary B: the interval is derived by production code from the two event
+  // timestamps, not supplied by this test.
+  const [settled] = logger.find('voice_ownership.superseded_closed')
+  assert.equal(settled.supersededLingerMs, 5_530)
+  assert.equal(settled.evicted.instanceId, 'inst_old_a1b2')
+  assert.equal(settled.replacedBy.instanceId, 'inst_new_c3d4')
+  assert.equal(settled.evicted.label, settled.replacedBy.label)
+  // A stable correlation id joins boundary A to boundary B, without relying on
+  // the label, which is identical on both sides.
+  assert.equal(settled.takeoverId, claim.takeoverId)
+  assert.equal(
+    new Date(settled.closedAt) - new Date(settled.claimedAt),
+    5_530,
   )
-  assert.equal(deactivated.evicted.label, deactivated.replacedBy.label)
+  // Both numbers on one line, so nobody reads the arbitration cost as the delay.
+  assert.equal(settled.arbitrationLatencyMs, 0)
+  // A lingering superseded connection is the ESS-974 failure shape and must
+  // surface without anyone knowing to grep for it.
+  assert.equal(settled.level, 'warn')
+  assert.match(settled.message, /5530 毫秒/)
+})
+
+test('a takeover whose loser closes at once is not confused with a late one', () => {
+  const logger = recordingLogger()
+  const clients = new ActiveVoiceClients()
+  const now = fakeClock()
+  const incumbent = voiceConnection({ clients, logger, now, instanceId: 'inst_a' })
+  const claimant = voiceConnection({ clients, logger, now, instanceId: 'inst_b' })
+
+  incumbent.claim({ takeover: false })
+  claimant.claim({ takeover: true })
+  // No clock advance: the loser tears down inside the same tick.
+  incumbent.close()
+
+  const [settled] = logger.find('voice_ownership.superseded_closed')
+  assert.equal(settled.supersededLingerMs, 0)
+  // Identical arbitration cost as the 5530ms case above — which is precisely
+  // why arbitration cost cannot be the signal. Only the linger separates them.
+  assert.equal(settled.arbitrationLatencyMs, 0)
+  assert.equal(settled.level, 'info')
+  assert.equal(settled.message, undefined)
+})
+
+test('a connection that wins the slot back does not report a stale linger', () => {
+  const logger = recordingLogger()
+  const clients = new ActiveVoiceClients()
+  const now = fakeClock()
+  const first = voiceConnection({ clients, logger, now, instanceId: 'inst_a' })
+  const second = voiceConnection({ clients, logger, now, instanceId: 'inst_b' })
+
+  first.claim({ takeover: false })
+  second.claim({ takeover: true })
+  now.advance(120_000)
+  // The evicted connection takes the slot back instead of dying.
+  first.claim({ takeover: true })
+  now.advance(60_000)
+  first.close()
+
+  assert.equal(logger.find('voice_ownership.superseded_closed').length, 0)
+})
+
+test('mute followed by close reports the superseded window once', () => {
+  const logger = recordingLogger()
+  const clients = new ActiveVoiceClients()
+  const now = fakeClock()
+  const incumbent = voiceConnection({ clients, logger, now, instanceId: 'inst_a' })
+  const claimant = voiceConnection({ clients, logger, now, instanceId: 'inst_b' })
+
+  incumbent.claim({ takeover: false })
+  claimant.claim({ takeover: true })
+  now.advance(5_530)
+  incumbent.close()
+  now.advance(90_000)
+  incumbent.close()
+
+  const settled = logger.find('voice_ownership.superseded_closed')
+  assert.equal(settled.length, 1)
+  assert.equal(settled[0].supersededLingerMs, 5_530)
 })
 
 test('a refused claim is logged as refused, not as a silent no-op', () => {

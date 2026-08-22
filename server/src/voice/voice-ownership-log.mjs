@@ -58,7 +58,7 @@ export function claimRecord({
 export function deactivationRecord({
   descriptor,
   replacement,
-  now = Date.now(),
+  now,
   hadInput = false,
   hadOutput = false,
 }) {
@@ -66,13 +66,52 @@ export function deactivationRecord({
     takeoverId: replacement?.takeoverId || null,
     evicted: ownershipParty(descriptor),
     replacedBy: ownershipParty(replacement?.descriptor),
-    // Gap between the newcomer winning arbitration and this socket actually
-    // tearing down. ESS-974 observed 5.53s here with no way to attribute it.
-    elapsedSinceClaimMs: replacement?.takeoverAt
+    // ActiveVoiceClients.activate() calls the loser's deactivate() inline
+    // (active-voice-clients.mjs:21), so this is the in-process arbitration
+    // cost and is ~0 by construction. It is NOT the ESS-974 takeover delay —
+    // that one spans two connections and is measured by
+    // supersedeSettledRecord() below. ESS-992 was filed because the two were
+    // reported under one name.
+    arbitrationLatencyMs: replacement?.takeoverAt
       ? now - replacement.takeoverAt
       : null,
     hadInput,
     hadOutput,
+  }
+}
+
+/**
+ * Closes the takeover out, on the evicted connection's own teardown.
+ *
+ * The two boundaries are both real production events, on two different
+ * connections:
+ *
+ *   A. `voice_ownership.claim` stamps `takeoverAt` when the newcomer wins
+ *      arbitration (realtime-gateway.mjs, before activate()).
+ *   B. this record is written when the connection that lost the slot finally
+ *      reaches release() — i.e. its websocket closed.
+ *
+ * B - A is `supersededLingerMs`: how long a superseded connection stayed alive
+ * on this server after losing ownership. That is the window ESS-974 needs, and
+ * the only one a late `voice.deactivated` can arrive inside.
+ */
+export function supersedeSettledRecord({ descriptor, superseded, closedAt }) {
+  const claimedAt = Number.isFinite(superseded?.claimedAt)
+    ? superseded.claimedAt
+    : null
+  return {
+    // Same id as the claim record, so both ends of the window join on one grep.
+    takeoverId: superseded?.takeoverId || null,
+    evicted: ownershipParty(descriptor),
+    replacedBy: superseded?.replacedBy || null,
+    claimedAt: claimedAt === null ? null : new Date(claimedAt).toISOString(),
+    closedAt: new Date(closedAt).toISOString(),
+    supersededLingerMs: claimedAt === null ? null : closedAt - claimedAt,
+    // Carried along so one line shows both numbers: nobody can mistake the
+    // synchronous arbitration cost for the cross-connection linger again.
+    arbitrationLatencyMs: superseded?.arbitrationLatencyMs ?? null,
+    hadInput: Boolean(superseded?.hadInput),
+    hadOutput: Boolean(superseded?.hadOutput),
   }
 }
 
