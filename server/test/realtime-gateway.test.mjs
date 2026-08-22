@@ -3,7 +3,9 @@ import test from 'node:test'
 import {
   acceptsPlaybackReceipt,
   confirmsTaskNotificationOnPlaybackStart,
+  publicResponseDoneEvent,
   rejectUnsupportedRealtimeUpgrade,
+  shouldSuppressDeferredToolResponse,
 } from '../src/voice/realtime-gateway.mjs'
 import { isResponseActivityEvent } from '../src/voice/response-lifecycle.mjs'
 import { GatewayClientEvent } from '../../shared/realtime-events.mjs'
@@ -76,6 +78,69 @@ test('accepts playback receipts only from the active output client for a known r
     active: true,
     responseKnown: false,
   }), false)
+})
+
+test('forwards validated response.done metadata with flat and compatible fields', () => {
+  assert.deepEqual(publicResponseDoneEvent({
+    responseId: 'response-1',
+    status: 'completed',
+    context: {
+      origin: 'model',
+      turnId: 'turn-1',
+      turnGeneration: 3,
+      taskId: 'task-1',
+      hasFunctionCall: true,
+    },
+  }), {
+    type: 'response.done',
+    responseId: 'response-1',
+    origin: 'model',
+    status: 'completed',
+    hasFunctionCall: true,
+    turnId: 'turn-1',
+    taskId: 'task-1',
+    taskIds: ['task-1'],
+    turnGeneration: 3,
+    response: { id: 'response-1', status: 'completed' },
+  })
+  assert.equal(publicResponseDoneEvent({ responseId: '   ' }), null)
+})
+
+test('current-turn action promise does not suppress its tool result response', () => {
+  const currentTurn = {
+    responseTurnId: 'turn-1',
+    currentTurnId: 'turn-1',
+    currentTurnGeneration: 3,
+  }
+  assert.equal(shouldSuppressDeferredToolResponse({
+    ...currentTurn,
+    context: {
+      origin: 'model',
+      turnGeneration: 3,
+      hasFunctionCall: true,
+      hasAudio: true,
+      assistantTranscript: '我正在查询',
+    },
+  }), false)
+  assert.equal(shouldSuppressDeferredToolResponse({
+    ...currentTurn,
+    context: {
+      origin: 'announcement',
+      turnGeneration: 3,
+      hasFunctionCall: true,
+      hasAudio: true,
+    },
+  }), true)
+  assert.equal(shouldSuppressDeferredToolResponse({
+    ...currentTurn,
+    responseTurnId: 'stale-turn',
+    context: {
+      origin: 'model',
+      turnGeneration: 2,
+      hasFunctionCall: true,
+      hasAudio: true,
+    },
+  }), true)
 })
 
 test('recognizes response activity when response.created is omitted', () => {
