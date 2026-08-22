@@ -547,3 +547,69 @@ test('projects legacy decision presentation when restoring a task', () => {
   manager.persist()
   assert.deepEqual(saved[0].resultMetadata, restored.resultMetadata)
 })
+
+const flush = () => new Promise(resolve => { setImmediate(resolve) })
+
+test('reclaims the coordinator lane when a work task blows its wall-clock budget', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const manager = new TaskManager({ workTaskTimeoutMs: 60_000, progressCheckMs: 0 })
+  const started = []
+  // A runner wedged inside the backend: it never observes the abort signal.
+  // Only the force-fail branch can reclaim the lane in that case.
+  const wedged = manager.create({
+    objective: 'wedged',
+    ownerId: 'owner',
+    sessionId: 'voice',
+    laneKey: 'coordinator:owner',
+    runner: async () => {
+      started.push('wedged')
+      return new Promise(() => {})
+    },
+  })
+  const queued = manager.create({
+    objective: 'queued',
+    ownerId: 'owner',
+    sessionId: 'voice',
+    laneKey: 'coordinator:owner',
+    runner: async () => {
+      started.push('queued')
+      return { content: 'ok' }
+    },
+  })
+  await flush()
+  assert.deepEqual(started, ['wedged'])
+  assert.equal(manager.get(queued.id).status, 'queued')
+  assert.equal(manager.get(wedged.id).timeoutMs, 60_000)
+
+  t.mock.timers.tick(60_000)
+  await flush()
+  t.mock.timers.tick(5_000)
+  await flush()
+
+  const failed = manager.get(wedged.id)
+  assert.equal(failed.status, 'failed')
+  assert.match(failed.error, /后台工作执行超时/)
+  assert.equal(failed.notificationStatus, 'pending')
+  // The lane was free the moment the wedged task was reclaimed, so the
+  // queued task not only started but ran straight through.
+  assert.deepEqual(started, ['wedged', 'queued'])
+  assert.equal(manager.get(queued.id).status, 'completed')
+})
+
+test('a work task that finishes inside its budget is never force-failed', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const manager = new TaskManager({ workTaskTimeoutMs: 60_000, progressCheckMs: 0 })
+  const task = manager.create({
+    objective: 'quick',
+    ownerId: 'owner',
+    sessionId: 'voice',
+    laneKey: 'coordinator:owner',
+    runner: async () => ({ content: 'done' }),
+  })
+  await flush()
+  t.mock.timers.tick(600_000)
+  await flush()
+  const settled = manager.get(task.id)
+  assert.equal(settled.status, 'completed')
+  assert.equal(settled.error, null)
+})

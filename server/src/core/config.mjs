@@ -499,6 +499,15 @@ export const config = {
     1_800_000,
     { min: 60_000 },
   ),
+  // Interactive background work shares a single per-owner coordinator lane
+  // (laneLimit 1). A run that hangs inside the backend would otherwise hold
+  // that lane forever and every later request queues behind it, so `work`
+  // gets the same wall-clock budget scheduled tasks already had.
+  workTaskTimeoutMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_WORK_TASK_TIMEOUT_MS,
+    1_800_000,
+    { min: 60_000 },
+  ),
   backgroundTaskProgressCheckMs: numberSetting(
     process.env.QWEN_AUDIO_AGENT_BACKGROUND_TASK_PROGRESS_CHECK_MS
       || process.env.QWEN_AUDIO_AGENT_SCHEDULED_TASK_PROGRESS_CHECK_MS,
