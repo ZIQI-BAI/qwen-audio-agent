@@ -15,6 +15,10 @@ const CANCELLABLE = new Set(['scheduled', 'queued', 'running', 'delegated', 'fin
 const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
 const REPLAYABLE_REMINDER = new Set(['queued', 'running'])
 
+function timeoutLabel(kind) {
+  return kind === 'scheduled_task' ? '定时任务' : '后台工作'
+}
+
 export function taskExecutionContext(task, { onEvent, signal }) {
   return Object.freeze({
     taskId: String(task.id),
@@ -109,6 +113,7 @@ export class TaskManager {
     notificationClaimTtlMs = 60_000,
     maxTerminalTasksPerOwner = 100,
     progressCheckMs = config.backgroundTaskProgressCheckMs,
+    workTaskTimeoutMs = config.workTaskTimeoutMs,
     laneStuckWarnMs = config.taskLaneStuckWarnMs,
     logger: taskLogger = null,
   } = {}) {
@@ -123,6 +128,7 @@ export class TaskManager {
     this.notificationClaimTtlMs = notificationClaimTtlMs
     this.maxTerminalTasksPerOwner = maxTerminalTasksPerOwner
     this.progressCheckMs = Math.max(0, Number(progressCheckMs) || 0)
+    this.workTaskTimeoutMs = Math.max(0, Number(workTaskTimeoutMs) || 0)
     this.laneStuckWarnMs = Math.max(0, Number(laneStuckWarnMs) || 0)
       || 3_600_000
     this.logger = taskLogger
@@ -446,6 +452,9 @@ export class TaskManager {
       progressCheckMs: String(kind || 'work') === 'work'
         ? this.progressCheckMs
         : null,
+      timeoutMs: String(kind || 'work') === 'work'
+        ? this.workTaskTimeoutMs
+        : null,
     }
     task.promise = new Promise(resolve => {
       task.resolve = resolve
@@ -650,20 +659,25 @@ export class TaskManager {
     ) {
       task.runner = this.scheduledTaskRunner
     }
-    // Hard timeout watchdog for scheduled tasks (borrowed from OpenClaw's
-    // per-run wall-clock budget). Aborts the runner, then gives a 5-second
-    // cleanup window before force-failing.
-    if (task.kind === 'scheduled_task' && task.timeoutMs) {
+    // Hard timeout watchdog for every task carrying a wall-clock budget
+    // (borrowed from OpenClaw's per-run budget). Aborts the runner, then
+    // gives a 5-second cleanup window before force-failing. The force-fail
+    // branch is the one that matters: a runner wedged inside the backend
+    // never observes the abort, and without it the task keeps its scheduler
+    // lane forever.
+    if (task.timeoutMs) {
       task.timeoutTimer = setTimeout(() => {
         if (!ACTIVE.has(task.status)) return
         task.abortController?.abort(
-          new Error('定时任务执行超时，正在终止'),
+          new Error(`${timeoutLabel(task.kind)}执行超时，正在终止`),
         )
         const cleanup = setTimeout(() => {
           if (!ACTIVE.has(task.status)) return
           task.terminalHandled = true
           task.status = 'failed'
-          task.error = `定时任务执行超时（${Math.round(task.timeoutMs / 60000)} 分钟）`
+          task.error = `${timeoutLabel(task.kind)}执行超时（${
+            Math.round(task.timeoutMs / 60000)
+          } 分钟）`
           task.completedAt = Date.now()
           task.elapsedMs = task.startedAt
             ? task.completedAt - task.startedAt : 0
