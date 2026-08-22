@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   acceptsPlaybackReceipt,
   confirmsTaskNotificationOnPlaybackStart,
+  publicResponseDoneEvent,
   rejectUnsupportedRealtimeUpgrade,
 } from '../src/voice/realtime-gateway.mjs'
 import { isResponseActivityEvent } from '../src/voice/response-lifecycle.mjs'
@@ -76,6 +77,41 @@ test('accepts playback receipts only from the active output client for a known r
     active: true,
     responseKnown: false,
   }), false)
+})
+
+test('forwards response.done metadata required by downstream turn state machines', () => {
+  assert.deepEqual(publicResponseDoneEvent({
+    event: {
+      type: 'response.done',
+      response: { id: 'response-tool', status: 'completed' },
+    },
+    context: {
+      turnId: 'turn-7',
+      origin: 'model',
+      hasFunctionCall: true,
+    },
+  }), {
+    type: 'response.done',
+    responseId: 'response-tool',
+    turnId: 'turn-7',
+    origin: 'model',
+    status: 'completed',
+    hasFunctionCall: true,
+  })
+})
+
+test('response.done public contract is conservative when correlation is missing', () => {
+  assert.deepEqual(publicResponseDoneEvent({
+    event: { type: 'response.done', response: { id: 'response-unknown' } },
+    fallbackTurnId: 'turn-current',
+  }), {
+    type: 'response.done',
+    responseId: 'response-unknown',
+    turnId: 'turn-current',
+    origin: 'model',
+    status: null,
+    hasFunctionCall: false,
+  })
 })
 
 test('recognizes response activity when response.created is omitted', () => {

@@ -111,6 +111,24 @@ export function acceptsPlaybackReceipt({
   return outputEnabled === true && active === true && responseKnown === true
 }
 
+// ESS-1052: response-level completion metadata is part of the frontend
+// contract, not an implementation-only log. Downstream gateways need
+// hasFunctionCall to distinguish a segment boundary from a completed turn.
+export function publicResponseDoneEvent({ event = {}, context, fallbackTurnId = '' }) {
+  const responseId = realtimeResponseId(event)
+  const status = typeof event.response?.status === 'string'
+    ? event.response.status
+    : null
+  return {
+    type: 'response.done',
+    responseId,
+    turnId: context?.turnId || fallbackTurnId || null,
+    origin: context?.origin || 'model',
+    status,
+    hasFunctionCall: context?.hasFunctionCall === true,
+  }
+}
+
 function clientDescriptor(event = {}) {
   const type = ['desktop', 'cli', 'web'].includes(event.clientType)
     ? event.clientType
@@ -1299,6 +1317,11 @@ export function attachRealtimeGateway(server, {
           // tracked — silently treated as unsuppressed everywhere downstream.
           contextKnown: Boolean(responseContext),
         })
+        send(ws, publicResponseDoneEvent({
+          event,
+          context: responseContext,
+          fallbackTurnId: responseTurnId,
+        }))
         toolCalls.finishToolResponse(id, {
           suppressResponse,
         }).catch(error => {
