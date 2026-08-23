@@ -122,6 +122,71 @@ export function sendTaskEvent(ws, event = {}) {
   })
 }
 
+const PUBLIC_RESPONSE_ORIGINS = new Set([
+  'model',
+  'agent',
+  'announcement',
+  'permission',
+])
+
+export function publicResponseDoneEvent({
+  responseId,
+  context = {},
+  status,
+} = {}) {
+  const id = String(responseId || '').trim()
+  if (!id) return null
+  const origin = PUBLIC_RESPONSE_ORIGINS.has(context.origin)
+    ? context.origin
+    : 'model'
+  const normalizedStatus = typeof status === 'string' && status.trim()
+    ? status.trim()
+    : null
+  const taskIds = Array.isArray(context.taskIds)
+    ? context.taskIds.map(value => String(value || '').trim()).filter(Boolean)
+    : []
+  const taskId = String(context.taskId || '').trim() || null
+  return {
+    type: GatewayServerEvent.RESPONSE_DONE,
+    responseId: id,
+    origin,
+    status: normalizedStatus,
+    hasFunctionCall: context.hasFunctionCall === true,
+    turnId: String(context.turnId || '').trim() || null,
+    taskId,
+    taskIds: taskIds.length ? taskIds : taskId ? [taskId] : [],
+    ...(Number.isInteger(context.turnGeneration)
+      ? { turnGeneration: context.turnGeneration }
+      : {}),
+    // Keep the OpenAI-compatible identity/status envelope while the gateway
+    // dialect's correlation fields remain flat like response.started.
+    response: { id, status: normalizedStatus },
+  }
+}
+
+export function shouldSuppressDeferredToolResponse({
+  responseFailed = false,
+  context = {},
+  responseTurnId = '',
+  currentTurnId = '',
+  currentTurnGeneration = -1,
+} = {}) {
+  const belongsToCurrentTurn = (
+    context.hasFunctionCall === true
+    && context.origin !== 'announcement'
+    && Boolean(responseTurnId)
+    && responseTurnId === currentTurnId
+    && Number.isInteger(context.turnGeneration)
+    && context.turnGeneration === currentTurnGeneration
+  )
+  return responseFailed
+    || Boolean(context.suppressed)
+    || (!belongsToCurrentTurn && (
+      Boolean(context.hasAudio)
+      || Boolean(context.assistantTranscript?.trim())
+    ))
+}
+
 function clientDescriptor(event = {}) {
   const type = ['desktop', 'cli', 'web'].includes(event.clientType)
     ? event.clientType
@@ -214,6 +279,7 @@ export function attachRealtimeGateway(server, {
     let userSpeaking = false
     let inputEnabled = false
     let outputEnabled = false
+    let manualTurnDetection = false
     // Set only by host arbitration. Unlike inputEnabled (which the client
     // declares about itself) this means the client has been ordered to stop
     // capturing, so nothing here may re-enable audio on its own.
@@ -1439,7 +1505,15 @@ export function attachRealtimeGateway(server, {
           hasAudio: Boolean(responseContext?.hasAudio),
           hasTranscript: Boolean(responseContext?.assistantTranscript?.trim()),
         }
-        const suppressResponse = Object.values(suppressParts).some(Boolean)
+        const suppressResponse = shouldSuppressDeferredToolResponse({
+          responseFailed,
+          context: responseContext,
+          responseTurnId,
+          currentTurnId: committedTurnId || turnId,
+          currentTurnGeneration: committedTurnId
+            ? committedTurnGeneration
+            : turnGeneration,
+        })
         connectionLogger.info('response.done', {
           responseId: id,
           turnId: responseTurnId,
@@ -1454,6 +1528,12 @@ export function attachRealtimeGateway(server, {
           // tracked — silently treated as unsuppressed everywhere downstream.
           contextKnown: Boolean(responseContext),
         })
+        const responseDoneEvent = publicResponseDoneEvent({
+          responseId: id,
+          context: responseContext,
+          status: responseStatus,
+        })
+        if (responseDoneEvent) send(ws, responseDoneEvent)
         toolCalls.finishToolResponse(id, {
           suppressResponse,
         }).catch(error => {
@@ -1666,6 +1746,7 @@ export function attachRealtimeGateway(server, {
         providerRegistry: realtimeProviderRegistry,
         agentContext: {
           client: clientContext,
+          manualTurnDetection,
           memories: memoryService?.list(ownerId, { limit: 64 }) || [],
           recentMessages: conversationSync.frontendContext({ ownerId, sessionId }),
         },
@@ -2118,6 +2199,7 @@ export function attachRealtimeGateway(server, {
           textOnly: event.textOnly === true,
         })
         nonVoiceClient = event.textOnly === true
+        manualTurnDetection = event.manualTurnDetection === true
         // The client may pick a realtime front end per session. An unknown
         // name is reported instead of silently falling back, so a typo does
         // not look like a working session on the wrong provider.
@@ -2158,6 +2240,7 @@ export function attachRealtimeGateway(server, {
           timeZone: event.timeZone,
           locale: event.locale,
           workingDirectory: event.workingDirectory,
+          instruction: event.instruction,
         })
         clientContext.states = (
           descriptor.type === 'desktop'
@@ -2283,6 +2366,11 @@ export function attachRealtimeGateway(server, {
         } catch (error) {
           send(ws, { type: GatewayServerEvent.ERROR, message: error.message })
         }
+      } else if (event.type === GatewayClientEvent.AUDIO_COMMIT) {
+        if (!inputEnabled || !activeVoiceClients.isActive(ownerId, voiceClient)) return
+        ensureFrontend()
+          .then(() => frontend?.commitAudio())
+          .catch(error => send(ws, { type: GatewayServerEvent.ERROR, message: error.message }))
       } else if (event.type === GatewayClientEvent.INTERRUPT) {
         sleepController.recordActivity()
         turnGeneration = ++turnSequence
