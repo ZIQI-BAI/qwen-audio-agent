@@ -26,6 +26,7 @@ import { TurnCorrelation } from './turn-correlation.mjs'
 import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
 import { CodexStreamProjector } from './codex-stream-projector.mjs'
+import { StreamingLatencyWindow } from './streaming-latency-window.mjs'
 import {
   ensureResponseContext,
   mergeResponseContext,
@@ -237,6 +238,7 @@ export function attachRealtimeGateway(server, {
     const transcripts = new TurnTranscripts()
     const announcedPermissions = new Set()
     const streamedTaskIds = new Set()
+    const streamingLatency = new StreamingLatencyWindow({ maxSamples: 100 })
     const streamIdentity = (task, generation = 1) => ({
       requestId: task.id,
       turnId: task.turnId || null,
@@ -248,6 +250,7 @@ export function attachRealtimeGateway(server, {
         turnId: context.turnId,
         taskId: context.taskId,
         streamSequence: context.sequence,
+        streamSegmentStartedAt: Date.now(),
       }),
       onSegment: segment => send(ws, {
         type: 'task.stream.segment',
@@ -257,7 +260,7 @@ export function attachRealtimeGateway(server, {
         text: segment.text,
       }),
       onDone: result => send(ws, {
-        type: 'task.stream.done',
+        type: result.aborted ? 'task.stream.aborted' : 'task.stream.done',
         taskId: result.taskId,
         turnId: result.turnId,
         final_sequence: result.final_sequence,
@@ -904,10 +907,16 @@ export function attachRealtimeGateway(server, {
         if (
           !config.codexSpeechStreaming
           || task.sessionId !== sessionId
-          || !outputEnabled
-          || !frontend?.ready
         ) return
         streamedTaskIds.add(task.id)
+        if (!outputEnabled || !frontend?.ready) {
+          codexStreamProjector.fallback(
+            streamIdentity(task, event.generation),
+            !outputEnabled ? 'voice_output_disabled' : 'frontend_not_ready',
+            event.chunk,
+          )
+          return
+        }
         try {
           codexStreamProjector.push(
             streamIdentity(task, event.generation),
@@ -919,6 +928,17 @@ export function attachRealtimeGateway(server, {
             error: error.message,
           })
         }
+        return
+      }
+      if (
+        ['task.cancelling', 'task.cancelled'].includes(event.type)
+        && streamedTaskIds.has(task.id)
+      ) {
+        codexStreamProjector.abort(
+          streamIdentity(task, task.streamGeneration || 1),
+          event.type,
+        )
+        streamedTaskIds.delete(task.id)
         return
       }
       if (event.type === 'task.progress.check') {
@@ -1050,6 +1070,8 @@ export function attachRealtimeGateway(server, {
             if (
               event.type === 'task.failed'
               || result.streaming_fallback_reason
+              || !outputEnabled
+              || !frontend?.ready
             ) {
               claimPendingNotifications([task.id])
               return
@@ -1278,6 +1300,29 @@ export function attachRealtimeGateway(server, {
         if (responseContext?.suppressed) return
         const responseTurnId = responseContext.turnId || turnId
         if (id) {
+          if (
+            !responseContext.hasAudio
+            && responseContext.streamSegmentStartedAt
+            && responseContext.streamSequence === 0
+          ) {
+            const latencyMs = Math.max(
+              0,
+              Date.now() - responseContext.streamSegmentStartedAt,
+            )
+            const metric = streamingLatency.record(latencyMs)
+            connectionLogger.info('task.streaming_first_audio', {
+              taskId: responseContext.taskId,
+              turnId: responseContext.turnId,
+              sequence: responseContext.streamSequence,
+              ...metric,
+            })
+            send(ws, {
+              type: 'task.stream.first_audio',
+              taskId: responseContext.taskId,
+              sequence: responseContext.streamSequence,
+              latency_ms: latencyMs,
+            })
+          }
           responseContext.hasAudio = true
           playbackTurns.set(id, responseTurnId)
           announcementWindow.queueAudio(id, {

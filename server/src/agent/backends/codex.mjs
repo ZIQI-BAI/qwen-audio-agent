@@ -59,6 +59,7 @@ export const codexBackendDriver = {
       externalMcp: true,
       nativeDelegation: false,
       backendUi: false,
+      streamDelegatedText: true,
     }
   },
 }

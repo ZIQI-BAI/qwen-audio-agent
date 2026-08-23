@@ -51,7 +51,7 @@ export class CodexStreamProjector {
       state = {
         key, identity: { ...identity }, text: '', buffer: '', pending: [],
         sequence: 0, speaking: false, terminal: false, fallback: null,
-        timer: null, donePromise: null, resolveDone: null,
+        aborted: false, timer: null, donePromise: null, resolveDone: null,
       }
       state.donePromise = new Promise(resolve => { state.resolveDone = resolve })
       this.streams.set(key, state)
@@ -68,6 +68,38 @@ export class CodexStreamProjector {
     state.text += text
     state.buffer += text
     this.flushReady(state)
+  }
+
+  fallback(identity, reason, chunk = '') {
+    const state = this.state(identity)
+    const text = String(chunk || '')
+    state.text += text
+    state.fallback ||= String(reason || 'projection_unavailable')
+    state.buffer = ''
+    state.pending = []
+    if (state.timer) {
+      this.clearTimer(state.timer)
+      state.timer = null
+    }
+    this.onFallback({
+      ...state.identity,
+      streaming_fallback_reason: state.fallback,
+      text: state.text,
+    })
+  }
+
+  abort(identity, reason = 'task_cancelled') {
+    const state = this.streams.get(keyOf(identity))
+    if (!state) return false
+    state.aborted = true
+    state.terminal = true
+    state.fallback ||= String(reason)
+    state.buffer = ''
+    state.pending = []
+    if (state.timer) this.clearTimer(state.timer)
+    state.timer = null
+    this.finishIfDrained(state, { force: true })
+    return true
   }
 
   flushReady(state) {
@@ -115,7 +147,16 @@ export class CodexStreamProjector {
         const text = state.pending.shift()
         const sequence = state.sequence++
         this.onSegment({ ...state.identity, sequence, text })
-        await this.speak(text, { ...state.identity, sequence })
+        const outcome = await this.speak(text, { ...state.identity, sequence })
+        if (state.aborted) break
+        if (!outcome?.completed) {
+          const reason = outcome?.status
+            || outcome?.phase
+            || (outcome?.cancelled ? 'cancelled' : '')
+            || (outcome?.failed ? 'failed' : '')
+            || 'speech_not_completed'
+          throw new Error(reason)
+        }
       }
     } catch (error) {
       state.fallback = String(error?.message || error || 'projection_failed')
@@ -143,13 +184,14 @@ export class CodexStreamProjector {
     return state.donePromise
   }
 
-  finishIfDrained(state) {
-    if (!state.terminal || state.speaking || state.pending.length) return
+  finishIfDrained(state, { force = false } = {}) {
+    if (!state.terminal || (!force && state.speaking) || state.pending.length) return
     const result = {
       ...state.identity,
       text: state.text,
       final_sequence: state.sequence - 1,
       streaming_fallback_reason: state.fallback,
+      aborted: state.aborted,
     }
     this.onDone(result)
     state.resolveDone(result)

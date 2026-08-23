@@ -703,7 +703,7 @@ export class AcpBackendAdapter {
     run.receivedUpdate = true
     if (
       stream
-      && this.protocol === 'codex'
+      && this.profile.streamDelegatedText === true
       && update?.sessionUpdate === 'agent_message_chunk'
       && update.content?.type === 'text'
       && String(update.content.text || '')

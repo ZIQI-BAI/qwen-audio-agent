@@ -61,6 +61,13 @@ is unsupported and breaks without notice.
 | `qwen-audio-agent/gateway-process` | `GatewayProcess`, `createGatewayProcess`, `GATEWAY_READY_MESSAGE`, `DEFAULT_GATEWAY_ENTRY`, `validateGatewayOrigin`, `portInUse` |
 | `qwen-audio-agent/gateway-lease` | `readGatewayLease`, `findRunningGateway`, `acquireGatewayLease` |
 | `qwen-audio-agent/realtime-events` | `GatewayClientEvent`, `GatewayServerEvent`, `GatewayTaskEvent` |
+
+Codex delegated speech streams publish ordered `task.stream.segment` events,
+followed by `task.stream.done` only after ACP termination and speech drain.
+`task.stream.fallback` retains the reason for complete-result replay,
+`task.stream.aborted` closes cancelled streams, and `task.stream.first_audio`
+reports the first segment's start-to-first-frame latency plus the server log's
+bounded 100-sample P95 window.
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`, `listSkins`, `removeSkin`, `effectiveOrbSkin`, `skinsDirectory`, `validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`, `configureOrbWindow`, `ORB_CHANNELS` |

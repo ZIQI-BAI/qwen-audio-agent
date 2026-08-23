@@ -54,6 +54,11 @@
 | `qwen-audio-agent/gateway-process` | `GatewayProcess`、`createGatewayProcess`、`GATEWAY_READY_MESSAGE`、`DEFAULT_GATEWAY_ENTRY`、`validateGatewayOrigin`、`portInUse` |
 | `qwen-audio-agent/gateway-lease` | `readGatewayLease`、`findRunningGateway`、`acquireGatewayLease` |
 | `qwen-audio-agent/realtime-events` | `GatewayClientEvent`、`GatewayServerEvent`、`GatewayTaskEvent` |
+
+Codex 委托语音流先发布有序的 `task.stream.segment`，仅在 ACP 终止且语音
+全部 drain 后发布 `task.stream.done`。`task.stream.fallback` 携带完整结果
+回退原因，`task.stream.aborted` 收口取消流，`task.stream.first_audio` 上报
+首段开始到首个音频帧的延迟；服务端日志同时维护最近 100 个样本的 P95。
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`、`listSkins`、`removeSkin`、`effectiveOrbSkin`、`skinsDirectory`、`validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`、`configureOrbWindow`、`ORB_CHANNELS` |
