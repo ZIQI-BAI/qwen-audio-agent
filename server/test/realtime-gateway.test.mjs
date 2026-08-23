@@ -4,6 +4,7 @@ import {
   acceptsPlaybackReceipt,
   confirmsTaskNotificationOnPlaybackStart,
   rejectUnsupportedRealtimeUpgrade,
+  sendTaskEvent,
 } from '../src/voice/realtime-gateway.mjs'
 import { isResponseActivityEvent } from '../src/voice/response-lifecycle.mjs'
 
@@ -71,6 +72,24 @@ test('accepts playback receipts only from the active output client for a known r
     active: true,
     responseKnown: false,
   }), false)
+})
+
+test('forwards a streamed task cancellation event to the client', () => {
+  const messages = []
+  const ws = {
+    readyState: 1,
+    send(payload) {
+      messages.push(JSON.parse(payload))
+    },
+  }
+  const event = {
+    type: 'task.cancelled',
+    task: { id: 'task-streamed', phase: 'cancelled' },
+  }
+
+  sendTaskEvent(ws, event)
+
+  assert.deepEqual(messages, [event])
 })
 
 test('recognizes response activity when response.created is omitted', () => {

@@ -11,6 +11,8 @@ const CORRELATED_CONTEXT_FIELDS = [
   'turnGeneration',
   'deliverySequence',
   'consumesTaskNotification',
+  'streamSequence',
+  'streamSegmentStartedAt',
 ]
 
 /**

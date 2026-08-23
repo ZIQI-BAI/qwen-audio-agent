@@ -2,6 +2,28 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TaskManager } from '../src/task/task-manager.mjs'
 
+test('forwards backend text chunks as ordered non-persistent task events', async () => {
+  const manager = new TaskManager()
+  const chunks = []
+  manager.subscribe(event => {
+    if (event.type === 'task.stream.chunk') chunks.push(event)
+  })
+  const task = manager.create({
+    objective: 'stream',
+    ownerId: 'owner',
+    sessionId: 'voice',
+    runner: async (_objective, { onEvent }) => {
+      for (const chunk of ['甲', '乙', '丙']) {
+        onEvent({ type: 'backend.stream.chunk', chunk })
+      }
+      return { content: '甲乙丙' }
+    },
+  })
+  await manager.wait(task.id)
+  assert.deepEqual(chunks.map(event => event.chunk), ['甲', '乙', '丙'])
+  assert.deepEqual(chunks.map(event => event.generation), [1, 1, 1])
+})
+
 test('serializes work in the same coordinator lane while accepting immediately', async () => {
   const manager = new TaskManager()
   const order = []

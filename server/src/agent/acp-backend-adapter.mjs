@@ -699,8 +699,20 @@ export class AcpBackendAdapter {
     this.permissionBroker.cancelScope(permissionScopeId)
   }
 
-  onSessionUpdate(run, update) {
+  onSessionUpdate(run, update, { stream = false } = {}) {
     run.receivedUpdate = true
+    if (
+      stream
+      && this.profile.streamDelegatedText === true
+      && update?.sessionUpdate === 'agent_message_chunk'
+      && update.content?.type === 'text'
+      && String(update.content.text || '')
+    ) {
+      run.onEvent?.({
+        type: 'backend.stream.chunk',
+        chunk: String(update.content.text),
+      })
+    }
     run.toolCalls ||= new Map()
     const activity = activityFromUpdate(update, run.toolCalls)
     if (activity) run.onEvent?.({ type: 'backend.activity', activity })
@@ -825,7 +837,9 @@ export class AcpBackendAdapter {
           {
             signal: controller.signal,
             timeoutMs: 0,
-            onUpdate: update => this.onSessionUpdate(run, update),
+            onUpdate: update => this.onSessionUpdate(run, update, {
+              stream: true,
+            }),
           },
         )
         record.status = 'completed'

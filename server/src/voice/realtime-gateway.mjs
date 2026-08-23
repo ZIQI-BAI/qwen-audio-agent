@@ -25,6 +25,8 @@ import { TurnTranscripts } from './tools/turn-transcripts.mjs'
 import { TurnCorrelation } from './turn-correlation.mjs'
 import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
+import { CodexStreamProjector } from './codex-stream-projector.mjs'
+import { StreamingLatencyWindow } from './streaming-latency-window.mjs'
 import {
   ensureResponseContext,
   mergeResponseContext,
@@ -110,6 +112,14 @@ export function acceptsPlaybackReceipt({
   responseKnown,
 }) {
   return outputEnabled === true && active === true && responseKnown === true
+}
+
+export function sendTaskEvent(ws, event = {}) {
+  send(ws, {
+    type: event.type,
+    task: event.task,
+    ...(event.permission ? { permission: event.permission } : {}),
+  })
 }
 
 function clientDescriptor(event = {}) {
@@ -235,6 +245,44 @@ export function attachRealtimeGateway(server, {
     const inputTurns = new TurnCorrelation()
     const transcripts = new TurnTranscripts()
     const announcedPermissions = new Set()
+    const streamedTaskIds = new Set()
+    const streamingLatency = new StreamingLatencyWindow({ maxSamples: 100 })
+    const streamIdentity = (task, generation = 1) => ({
+      requestId: task.id,
+      turnId: task.turnId || null,
+      taskId: task.id,
+      generation,
+    })
+    const codexStreamProjector = new CodexStreamProjector({
+      speak: (text, context) => frontend.speak(text, 'agent', {
+        turnId: context.turnId,
+        taskId: context.taskId,
+        streamSequence: context.sequence,
+        streamSegmentStartedAt: Date.now(),
+      }),
+      onSegment: segment => send(ws, {
+        type: 'task.stream.segment',
+        taskId: segment.taskId,
+        turnId: segment.turnId,
+        sequence: segment.sequence,
+        text: segment.text,
+      }),
+      onDone: result => send(ws, {
+        type: result.aborted ? 'task.stream.aborted' : 'task.stream.done',
+        taskId: result.taskId,
+        turnId: result.turnId,
+        final_sequence: result.final_sequence,
+        streaming_fallback_reason: result.streaming_fallback_reason,
+      }),
+      onFallback: result => {
+        connectionLogger.warn('task.streaming_fallback', result)
+        send(ws, {
+          type: 'task.stream.fallback',
+          taskId: result.taskId,
+          streaming_fallback_reason: result.streaming_fallback_reason,
+        })
+      },
+    })
     let permissionRetryTimer = null
     const activeSessionTasks = () => taskManager.list({
       ownerId,
@@ -863,6 +911,43 @@ export function attachRealtimeGateway(server, {
     const unsubscribeTasks = taskManager.subscribe(event => {
       const task = event.task
       if (event.ownerId !== ownerId) return
+      if (event.type === 'task.stream.chunk') {
+        if (
+          !config.codexSpeechStreaming
+          || task.sessionId !== sessionId
+        ) return
+        streamedTaskIds.add(task.id)
+        if (!outputEnabled || !frontend?.ready) {
+          codexStreamProjector.fallback(
+            streamIdentity(task, event.generation),
+            !outputEnabled ? 'voice_output_disabled' : 'frontend_not_ready',
+            event.chunk,
+          )
+          return
+        }
+        try {
+          codexStreamProjector.push(
+            streamIdentity(task, event.generation),
+            event.chunk,
+          )
+        } catch (error) {
+          connectionLogger.warn('task.streaming_projection_failed', {
+            taskId: task.id,
+            error: error.message,
+          })
+        }
+        return
+      }
+      if (
+        ['task.cancelling', 'task.cancelled'].includes(event.type)
+        && streamedTaskIds.has(task.id)
+      ) {
+        codexStreamProjector.abort(
+          streamIdentity(task, task.streamGeneration || 1),
+          event.type,
+        )
+        streamedTaskIds.delete(task.id)
+      }
       if (event.type === 'task.progress.check') {
         if (task.sessionId !== sessionId) return
         if (!outputEnabled || !frontend?.ready) return
@@ -905,11 +990,7 @@ export function attachRealtimeGateway(server, {
       }
       if (task.sessionId !== sessionId) return
       if (task.kind === 'control') return
-      send(ws, {
-        type: event.type,
-        task,
-        ...(event.permission ? { permission: event.permission } : {}),
-      })
+      sendTaskEvent(ws, event)
       if (event.type === 'task.permission.requested') {
         if (sleeping) {
           wakeFromSleep()
@@ -983,6 +1064,37 @@ export function attachRealtimeGateway(server, {
         }
       }
       if (['task.completed', 'task.failed'].includes(event.type)) {
+        const wasStreamed = streamedTaskIds.has(task.id)
+        if (wasStreamed) {
+          void codexStreamProjector.terminal(streamIdentity(
+            task,
+            task.streamGeneration || 1,
+          )).then(result => {
+            if (
+              event.type === 'task.failed'
+              || result.streaming_fallback_reason
+              || !outputEnabled
+              || !frontend?.ready
+            ) {
+              claimPendingNotifications([task.id])
+              return
+            }
+            // The streamed speech is the notification delivery. Claim and
+            // confirm it atomically after every segment has drained so the
+            // final presentation is not spoken a second time.
+            const claimed = taskManager.claimNotifications({
+              ownerId,
+              sessionId,
+              claimantId: notificationClaimantId,
+              taskIds: [task.id],
+            })
+            taskManager.markNotificationsDelivered(
+              claimed.map(item => item.id),
+              { claimantId: notificationClaimantId },
+            )
+          })
+          streamedTaskIds.delete(task.id)
+        }
         recordResult(task)
         const inline = task.resultMetadata?.presentation?.inline
         if (inline?.content) {
@@ -996,7 +1108,7 @@ export function attachRealtimeGateway(server, {
             },
           })
         }
-        claimPendingNotifications([task.id])
+        if (!wasStreamed) claimPendingNotifications([task.id])
       }
     })
 
@@ -1191,6 +1303,29 @@ export function attachRealtimeGateway(server, {
         if (responseContext?.suppressed) return
         const responseTurnId = responseContext.turnId || turnId
         if (id) {
+          if (
+            !responseContext.hasAudio
+            && responseContext.streamSegmentStartedAt
+            && responseContext.streamSequence === 0
+          ) {
+            const latencyMs = Math.max(
+              0,
+              Date.now() - responseContext.streamSegmentStartedAt,
+            )
+            const metric = streamingLatency.record(latencyMs)
+            connectionLogger.info('task.streaming_first_audio', {
+              taskId: responseContext.taskId,
+              turnId: responseContext.turnId,
+              sequence: responseContext.streamSequence,
+              ...metric,
+            })
+            send(ws, {
+              type: 'task.stream.first_audio',
+              taskId: responseContext.taskId,
+              sequence: responseContext.streamSequence,
+              latency_ms: latencyMs,
+            })
+          }
           responseContext.hasAudio = true
           playbackTurns.set(id, responseTurnId)
           announcementWindow.queueAudio(id, {

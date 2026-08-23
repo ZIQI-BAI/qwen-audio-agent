@@ -64,6 +64,11 @@ export const GatewayTaskEvent = Object.freeze({
   PERMISSION_REQUESTED: 'task.permission.requested',
   PERMISSION_RESOLVED: 'task.permission.resolved',
   NOTIFICATION_OFFLINE: 'task.notification.offline',
+  STREAM_SEGMENT: 'task.stream.segment',
+  STREAM_DONE: 'task.stream.done',
+  STREAM_FALLBACK: 'task.stream.fallback',
+  STREAM_ABORTED: 'task.stream.aborted',
+  STREAM_FIRST_AUDIO: 'task.stream.first_audio',
 })
 
 export const GATEWAY_CLIENT_EVENT_TYPES = new Set(
