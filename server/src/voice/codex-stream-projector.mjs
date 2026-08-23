@@ -51,7 +51,8 @@ export class CodexStreamProjector {
       state = {
         key, identity: { ...identity }, text: '', buffer: '', pending: [],
         sequence: 0, speaking: false, terminal: false, fallback: null,
-        aborted: false, timer: null, donePromise: null, resolveDone: null,
+        aborted: false, finished: false, timer: null,
+        donePromise: null, resolveDone: null,
       }
       state.donePromise = new Promise(resolve => { state.resolveDone = resolve })
       this.streams.set(key, state)
@@ -185,7 +186,9 @@ export class CodexStreamProjector {
   }
 
   finishIfDrained(state, { force = false } = {}) {
+    if (state.finished) return
     if (!state.terminal || (!force && state.speaking) || state.pending.length) return
+    state.finished = true
     const result = {
       ...state.identity,
       text: state.text,

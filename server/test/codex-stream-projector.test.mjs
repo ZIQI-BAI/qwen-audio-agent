@@ -121,3 +121,23 @@ test('aborts a cancelled task and clears its stream state', async () => {
   assert.equal(timerCleared, true)
   assert.equal(projector.streams.size, 0)
 })
+
+test('emits one aborted terminal event when cancellation races in-flight speech', async () => {
+  let releaseSpeak
+  const doneEvents = []
+  const projector = new CodexStreamProjector({
+    speak: () => new Promise(resolve => { releaseSpeak = resolve }),
+    onDone: result => doneEvents.push(result),
+  })
+
+  projector.push(identity, '正在播报。')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(projector.abort(identity, 'task.cancelled'), true)
+  releaseSpeak({ cancelled: true })
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(doneEvents.length, 1)
+  assert.equal(doneEvents[0].aborted, true)
+  assert.equal(doneEvents[0].streaming_fallback_reason, 'task.cancelled')
+  assert.equal(projector.streams.size, 0)
+})

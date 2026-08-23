@@ -114,6 +114,14 @@ export function acceptsPlaybackReceipt({
   return outputEnabled === true && active === true && responseKnown === true
 }
 
+export function sendTaskEvent(ws, event = {}) {
+  send(ws, {
+    type: event.type,
+    task: event.task,
+    ...(event.permission ? { permission: event.permission } : {}),
+  })
+}
+
 function clientDescriptor(event = {}) {
   const type = ['desktop', 'cli', 'web'].includes(event.clientType)
     ? event.clientType
@@ -939,7 +947,6 @@ export function attachRealtimeGateway(server, {
           event.type,
         )
         streamedTaskIds.delete(task.id)
-        return
       }
       if (event.type === 'task.progress.check') {
         if (task.sessionId !== sessionId) return
@@ -983,11 +990,7 @@ export function attachRealtimeGateway(server, {
       }
       if (task.sessionId !== sessionId) return
       if (task.kind === 'control') return
-      send(ws, {
-        type: event.type,
-        task,
-        ...(event.permission ? { permission: event.permission } : {}),
-      })
+      sendTaskEvent(ws, event)
       if (event.type === 'task.permission.requested') {
         if (sleeping) {
           wakeFromSleep()
