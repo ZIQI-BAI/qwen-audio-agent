@@ -539,6 +539,9 @@ export const config = {
   wakeWordModelDirectory: process.env.QWEN_AUDIO_WAKE_WORD_MODEL_DIR
     ? resolve(process.env.QWEN_AUDIO_WAKE_WORD_MODEL_DIR)
     : resolve(runtimeEnvironment.configDirectory, 'models/wake-word'),
+  codexSpeechStreaming: String(
+    process.env.QWEN_AUDIO_AGENT_CODEX_SPEECH_STREAMING || 'true',
+  ).toLowerCase() !== 'false',
 }
 
 export function realtimeUrl(baseUrl, model) {

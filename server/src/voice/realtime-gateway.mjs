@@ -25,6 +25,7 @@ import { TurnTranscripts } from './tools/turn-transcripts.mjs'
 import { TurnCorrelation } from './turn-correlation.mjs'
 import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
+import { CodexStreamProjector } from './codex-stream-projector.mjs'
 import {
   ensureResponseContext,
   mergeResponseContext,
@@ -235,6 +236,42 @@ export function attachRealtimeGateway(server, {
     const inputTurns = new TurnCorrelation()
     const transcripts = new TurnTranscripts()
     const announcedPermissions = new Set()
+    const streamedTaskIds = new Set()
+    const streamIdentity = (task, generation = 1) => ({
+      requestId: task.id,
+      turnId: task.turnId || null,
+      taskId: task.id,
+      generation,
+    })
+    const codexStreamProjector = new CodexStreamProjector({
+      speak: (text, context) => frontend.speak(text, 'agent', {
+        turnId: context.turnId,
+        taskId: context.taskId,
+        streamSequence: context.sequence,
+      }),
+      onSegment: segment => send(ws, {
+        type: 'task.stream.segment',
+        taskId: segment.taskId,
+        turnId: segment.turnId,
+        sequence: segment.sequence,
+        text: segment.text,
+      }),
+      onDone: result => send(ws, {
+        type: 'task.stream.done',
+        taskId: result.taskId,
+        turnId: result.turnId,
+        final_sequence: result.final_sequence,
+        streaming_fallback_reason: result.streaming_fallback_reason,
+      }),
+      onFallback: result => {
+        connectionLogger.warn('task.streaming_fallback', result)
+        send(ws, {
+          type: 'task.stream.fallback',
+          taskId: result.taskId,
+          streaming_fallback_reason: result.streaming_fallback_reason,
+        })
+      },
+    })
     let permissionRetryTimer = null
     const activeSessionTasks = () => taskManager.list({
       ownerId,
@@ -863,6 +900,27 @@ export function attachRealtimeGateway(server, {
     const unsubscribeTasks = taskManager.subscribe(event => {
       const task = event.task
       if (event.ownerId !== ownerId) return
+      if (event.type === 'task.stream.chunk') {
+        if (
+          !config.codexSpeechStreaming
+          || task.sessionId !== sessionId
+          || !outputEnabled
+          || !frontend?.ready
+        ) return
+        streamedTaskIds.add(task.id)
+        try {
+          codexStreamProjector.push(
+            streamIdentity(task, event.generation),
+            event.chunk,
+          )
+        } catch (error) {
+          connectionLogger.warn('task.streaming_projection_failed', {
+            taskId: task.id,
+            error: error.message,
+          })
+        }
+        return
+      }
       if (event.type === 'task.progress.check') {
         if (task.sessionId !== sessionId) return
         if (!outputEnabled || !frontend?.ready) return
@@ -983,6 +1041,35 @@ export function attachRealtimeGateway(server, {
         }
       }
       if (['task.completed', 'task.failed'].includes(event.type)) {
+        const wasStreamed = streamedTaskIds.has(task.id)
+        if (wasStreamed) {
+          void codexStreamProjector.terminal(streamIdentity(
+            task,
+            task.streamGeneration || 1,
+          )).then(result => {
+            if (
+              event.type === 'task.failed'
+              || result.streaming_fallback_reason
+            ) {
+              claimPendingNotifications([task.id])
+              return
+            }
+            // The streamed speech is the notification delivery. Claim and
+            // confirm it atomically after every segment has drained so the
+            // final presentation is not spoken a second time.
+            const claimed = taskManager.claimNotifications({
+              ownerId,
+              sessionId,
+              claimantId: notificationClaimantId,
+              taskIds: [task.id],
+            })
+            taskManager.markNotificationsDelivered(
+              claimed.map(item => item.id),
+              { claimantId: notificationClaimantId },
+            )
+          })
+          streamedTaskIds.delete(task.id)
+        }
         recordResult(task)
         const inline = task.resultMetadata?.presentation?.inline
         if (inline?.content) {
@@ -996,7 +1083,7 @@ export function attachRealtimeGateway(server, {
             },
           })
         }
-        claimPendingNotifications([task.id])
+        if (!wasStreamed) claimPendingNotifications([task.id])
       }
     })
 

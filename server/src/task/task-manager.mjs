@@ -620,6 +620,15 @@ export class TaskManager {
         return
       }
       if (['cancelling', 'cancelled'].includes(task.status)) return
+      if (event?.type === 'backend.stream.chunk' && event.chunk) {
+        task.streamGeneration = task.streamGeneration || 1
+        this.emit('task.stream.chunk', task, {
+          persist: false,
+          chunk: String(event.chunk),
+          generation: task.streamGeneration,
+        })
+        return
+      }
       if (event?.type === 'backend.delegated' && event.delegation) {
         task.status = 'delegated'
         task.delegation = { ...event.delegation }
