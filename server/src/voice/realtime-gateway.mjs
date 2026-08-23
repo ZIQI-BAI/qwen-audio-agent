@@ -106,6 +106,27 @@ export function confirmsTaskNotificationOnPlaybackStart(context) {
   )
 }
 
+// A voice interruption is a turn cancellation, not merely a provider audio
+// cancellation. Work spawned by that exact turn may be blocked on native
+// permission while still holding the owner's coordinator lane. Leaving it
+// alive makes every following tool turn queue behind work the user explicitly
+// abandoned. Keep the scope exact: other turns and sessions are background
+// work and must not be cancelled as collateral damage.
+export function cancelInterruptedTurnTasks({
+  taskManager, ownerId, sessionId, turnId,
+}) {
+  if (!turnId) return []
+  const tasks = taskManager.list({ ownerId, sessionId, active: true })
+    .filter(task => task.turnId === turnId)
+  for (const task of tasks) {
+    // `cancel` enters `cancelling` synchronously and is idempotent. Do not
+    // block the realtime event loop on a backend that is slow to acknowledge;
+    // TaskManager's cancellation path owns the bounded abort and lane release.
+    taskManager.cancel(task.id, { ownerId }).catch(() => {})
+  }
+  return tasks.map(task => task.id)
+}
+
 export function acceptsPlaybackReceipt({
   outputEnabled,
   active,
@@ -2373,6 +2394,15 @@ export function attachRealtimeGateway(server, {
           .catch(error => send(ws, { type: GatewayServerEvent.ERROR, message: error.message }))
       } else if (event.type === GatewayClientEvent.INTERRUPT) {
         sleepController.recordActivity()
+        const interruptedTurnId = committedTurnId || turnId
+        const cancelledTaskIds = cancelInterruptedTurnTasks({
+          taskManager, ownerId, sessionId, turnId: interruptedTurnId,
+        })
+        connectionLogger.info('turn.tasks_cancelled_on_interrupt', {
+          turnId: interruptedTurnId || null,
+          taskIds: cancelledTaskIds,
+          taskCount: cancelledTaskIds.length,
+        })
         turnGeneration = ++turnSequence
         committedTurnGeneration = turnGeneration
         announcementWindow.interrupt()

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   acceptsPlaybackReceipt,
+  cancelInterruptedTurnTasks,
   confirmsTaskNotificationOnPlaybackStart,
   publicResponseDoneEvent,
   rejectUnsupportedRealtimeUpgrade,
@@ -97,6 +98,39 @@ test('forwards a streamed task cancellation event to the client', () => {
   sendTaskEvent(ws, event)
 
   assert.deepEqual(messages, [event])
+})
+
+test('interrupt cancels only active work owned by the interrupted turn', async () => {
+  const cancelled = []
+  const tasks = [
+    { id: 'weather', turnId: 'turn-old' },
+    { id: 'other-turn', turnId: 'turn-new' },
+  ]
+  const taskManager = {
+    list(query) {
+      assert.deepEqual(query, { ownerId: 'owner-1', sessionId: 'session-1', active: true })
+      return tasks
+    },
+    async cancel(id, options) {
+      cancelled.push({ id, options })
+    },
+  }
+
+  assert.deepEqual(cancelInterruptedTurnTasks({
+    taskManager, ownerId: 'owner-1', sessionId: 'session-1', turnId: 'turn-old',
+  }), ['weather'])
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(cancelled, [{ id: 'weather', options: { ownerId: 'owner-1' } }])
+})
+
+test('interrupt without a turn identity cannot cancel session background work', () => {
+  const taskManager = {
+    list() { throw new Error('must not enumerate without an exact turn') },
+    cancel() { throw new Error('must not cancel without an exact turn') },
+  }
+  assert.deepEqual(cancelInterruptedTurnTasks({
+    taskManager, ownerId: 'owner-1', sessionId: 'session-1', turnId: '',
+  }), [])
 })
 
 test('forwards validated response.done metadata with flat and compatible fields', () => {
