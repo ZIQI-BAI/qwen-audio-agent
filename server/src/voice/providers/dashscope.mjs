@@ -85,6 +85,7 @@ export const dashscopeProvider = {
         session.input_audio_format = 'pcm'
       }
       session.turn_detection = profile.transportCapabilities.audioInput
+        && agentContext?.manualTurnDetection !== true
         ? profile.sessionDefaults.turnDetection
         : null
     }

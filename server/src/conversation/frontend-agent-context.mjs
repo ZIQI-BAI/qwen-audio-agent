@@ -9,6 +9,7 @@ const MAX_PROMPT_CHARS = 16000
 const MAX_ASSISTANT_CHARS = 4000
 const MAX_RECENT_MESSAGES = 10
 const MAX_RECENT_CHARS = 3500
+const MAX_CLIENT_INSTRUCTION_CHARS = 16000
 
 function clean(value) {
   return String(value || '').replace(/\s+/g, ' ').trim()
@@ -18,6 +19,7 @@ export function normalizeClientContext({
   timeZone,
   locale,
   workingDirectory,
+  instruction,
 } = {}) {
   let safeTimeZone = clean(timeZone)
   try {
@@ -36,10 +38,16 @@ export function normalizeClientContext({
     .replace(/[\r\n]+/g, ' ')
     .trim()
     .slice(0, 1024)
+  const safeInstruction = [...String(instruction || '')
+    .replaceAll('\0', '')
+    .trim()]
+    .slice(0, MAX_CLIENT_INSTRUCTION_CHARS)
+    .join('')
   return {
     timeZone: safeTimeZone,
     locale: safeLocale,
     workingDirectory: safeWorkingDirectory || null,
+    instruction: safeInstruction || null,
   }
 }
 
@@ -155,6 +163,13 @@ export function buildFrontendContext({
     '</runtime_context>',
   ].join('\n')
   return [
+    ...(normalizedClient.instruction
+      ? [
+          '<client_identity_instruction>',
+          normalizedClient.instruction,
+          '</client_identity_instruction>',
+        ]
+      : []),
     userPreferencesSection(memories),
     memorySection(memories),
     runtimeContext,

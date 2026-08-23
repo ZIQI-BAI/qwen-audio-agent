@@ -3,10 +3,17 @@ import test from 'node:test'
 import {
   acceptsPlaybackReceipt,
   confirmsTaskNotificationOnPlaybackStart,
+  publicResponseDoneEvent,
   rejectUnsupportedRealtimeUpgrade,
   sendTaskEvent,
+  shouldSuppressDeferredToolResponse,
 } from '../src/voice/realtime-gateway.mjs'
 import { isResponseActivityEvent } from '../src/voice/response-lifecycle.mjs'
+import { GatewayClientEvent } from '../../shared/realtime-events.mjs'
+
+test('exposes audio.commit as a supported gateway client event', () => {
+  assert.equal(GatewayClientEvent.AUDIO_COMMIT, 'audio.commit')
+})
 
 test('closes websocket upgrades outside the realtime endpoint', () => {
   let destroyed = false
@@ -90,6 +97,69 @@ test('forwards a streamed task cancellation event to the client', () => {
   sendTaskEvent(ws, event)
 
   assert.deepEqual(messages, [event])
+})
+
+test('forwards validated response.done metadata with flat and compatible fields', () => {
+  assert.deepEqual(publicResponseDoneEvent({
+    responseId: 'response-1',
+    status: 'completed',
+    context: {
+      origin: 'model',
+      turnId: 'turn-1',
+      turnGeneration: 3,
+      taskId: 'task-1',
+      hasFunctionCall: true,
+    },
+  }), {
+    type: 'response.done',
+    responseId: 'response-1',
+    origin: 'model',
+    status: 'completed',
+    hasFunctionCall: true,
+    turnId: 'turn-1',
+    taskId: 'task-1',
+    taskIds: ['task-1'],
+    turnGeneration: 3,
+    response: { id: 'response-1', status: 'completed' },
+  })
+  assert.equal(publicResponseDoneEvent({ responseId: '   ' }), null)
+})
+
+test('current-turn action promise does not suppress its tool result response', () => {
+  const currentTurn = {
+    responseTurnId: 'turn-1',
+    currentTurnId: 'turn-1',
+    currentTurnGeneration: 3,
+  }
+  assert.equal(shouldSuppressDeferredToolResponse({
+    ...currentTurn,
+    context: {
+      origin: 'model',
+      turnGeneration: 3,
+      hasFunctionCall: true,
+      hasAudio: true,
+      assistantTranscript: '我正在查询',
+    },
+  }), false)
+  assert.equal(shouldSuppressDeferredToolResponse({
+    ...currentTurn,
+    context: {
+      origin: 'announcement',
+      turnGeneration: 3,
+      hasFunctionCall: true,
+      hasAudio: true,
+    },
+  }), true)
+  assert.equal(shouldSuppressDeferredToolResponse({
+    ...currentTurn,
+    responseTurnId: 'stale-turn',
+    context: {
+      origin: 'model',
+      turnGeneration: 2,
+      hasFunctionCall: true,
+      hasAudio: true,
+    },
+  }), true)
 })
 
 test('recognizes response activity when response.created is omitted', () => {
