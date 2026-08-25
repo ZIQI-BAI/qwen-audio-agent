@@ -1,6 +1,27 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { activityFromUpdate } from '../src/agent/acp-backend-session-utils.mjs'
+import {
+  activityFromUpdate,
+  progressFromUpdate,
+} from '../src/agent/acp-backend-session-utils.mjs'
+
+test('projects ordered reasoning, tool and answer deltas without leaking secrets', () => {
+  const state = {}
+  const project = update => progressFromUpdate(update, state)
+  assert.deepEqual(project({ sessionUpdate: 'agent_thought_chunk', seq: 1,
+    content: { type: 'text', text: 'Inspecting files' } }),
+  { category: 'reasoning', seq: 1, text: 'Inspecting files' })
+  assert.equal(project({ sessionUpdate: 'agent_thought_chunk', seq: 1,
+    content: { type: 'text', text: 'duplicate' } }), null)
+  assert.deepEqual(project({ sessionUpdate: 'tool_call', seq: 2,
+    title: 'Run tests', rawInput: { token: 'never publish me' } }),
+  { category: 'tool', seq: 2, text: 'Run tests' })
+  assert.equal(project({ sessionUpdate: 'agent_message_chunk', seq: 3,
+    content: { type: 'text', text: 'API_KEY=secret' } }), null)
+  assert.deepEqual(project({ sessionUpdate: 'agent_message_chunk', seq: 4,
+    content: { type: 'text', text: 'Done' } }),
+  { category: 'answer', seq: 3, text: 'Done' })
+})
 
 test('projects an ACP plan into stable task progress', () => {
   assert.deepEqual(activityFromUpdate({

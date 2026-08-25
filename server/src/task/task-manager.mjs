@@ -181,6 +181,22 @@ export class TaskManager {
     this.laneSnapshotTimer = null
   }
 
+  recordStreamLatency(task) {
+    if (task.streamLatencyRecorded) return
+    task.streamLatencyRecorded = true
+    const sinceStart = timestamp => task.startedAt && timestamp
+      ? timestamp - task.startedAt : null
+    this.logger?.info('task.stream_latency', {
+      taskId: task.id,
+      status: task.status,
+      startMs: task.startedAt ? task.startedAt - task.createdAt : null,
+      firstStatusMs: sinceStart(task.firstStatusAt),
+      firstContentDeltaMs: sinceStart(task.firstContentDeltaAt),
+      firstAnswerDeltaMs: sinceStart(task.firstAnswerDeltaAt),
+      terminalMs: sinceStart(task.completedAt),
+    })
+  }
+
   count(status) {
     let total = 0
     for (const task of this.tasks.values()) {
@@ -594,17 +610,36 @@ export class TaskManager {
   start(task) {
     task.status = 'running'
     task.startedAt = Date.now()
+    task.firstStatusAt = task.startedAt
     task.abortController = new AbortController()
     this.scheduler.acquire(task)
     task.schedulerHeld = true
     this.emit('task.running', task)
     task.progressTimer = setInterval(() => {
       if (ACTIVE.has(task.status)) {
-        this.emit('task.progress', task, { persist: false })
+        this.emit('task.progress', task, { persist: false, heartbeat: true })
       }
     }, 1000)
     task.progressTimer.unref?.()
     const onEvent = event => {
+      if (event?.type === 'backend.task.progress' && event.progress) {
+        const progress = event.progress
+        if (!Number.isInteger(progress.seq)
+          || progress.seq <= (task.lastProgressSeq || 0)) return
+        task.lastProgressSeq = progress.seq
+        const now = Date.now()
+        task.firstStatusAt ||= now
+        task.firstContentDeltaAt ||= now
+        if (progress.category === 'answer') task.firstAnswerDeltaAt ||= now
+        this.emit('task.progress', task, {
+          persist: false,
+          heartbeat: false,
+          category: progress.category,
+          seq: progress.seq,
+          text: progress.text,
+        })
+        return
+      }
       if (event?.type === 'backend.permission.requested' && event.permission) {
         task.authorization = { ...event.permission }
         this.emit('task.permission.requested', task)
@@ -691,6 +726,7 @@ export class TaskManager {
           task.elapsedMs = task.startedAt
             ? task.completedAt - task.startedAt : 0
           task.notificationStatus = 'pending'
+          this.recordStreamLatency(task)
           clearInterval(task.progressTimer)
           task.progressTimer = null
           clearInterval(task.progressCheckTimer)
@@ -819,6 +855,7 @@ export class TaskManager {
           : 0
         task.notificationStatus = 'pending'
         task.terminalHandled = true
+        this.recordStreamLatency(task)
         if (task.schedulerHeld) {
           this.scheduler.release(task)
           task.schedulerHeld = false
@@ -887,6 +924,7 @@ export class TaskManager {
           : 0
         task.notificationStatus = 'pending'
         task.terminalHandled = true
+        this.recordStreamLatency(task)
         if (task.schedulerHeld) {
           this.scheduler.release(task)
           task.schedulerHeld = false
@@ -911,6 +949,7 @@ export class TaskManager {
     task.error = null
     task.notificationStatus = 'none'
     task.terminalHandled = true
+    this.recordStreamLatency(task)
     clearInterval(task.progressTimer)
     task.progressTimer = null
     if (task.timeoutTimer) { clearTimeout(task.timeoutTimer); task.timeoutTimer = null }

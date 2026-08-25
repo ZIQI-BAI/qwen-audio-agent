@@ -2,6 +2,88 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TaskManager } from '../src/task/task-manager.mjs'
 
+function recordingLogger(records) {
+  return {
+    debug() {}, warn() {},
+    info(event, details) {
+      if (event === 'task.stream_latency') records.push(details)
+    },
+  }
+}
+
+test('publishes content progress immediately and records completed latency once', async () => {
+  const latencies = []
+  const manager = new TaskManager({ logger: recordingLogger(latencies) })
+  const events = []
+  manager.subscribe(event => events.push(event))
+  const task = manager.create({ objective: 'stream', ownerId: 'owner', runner:
+    async (_objective, { onEvent }) => {
+      onEvent({ type: 'backend.task.progress', progress:
+        { category: 'reasoning', seq: 1, text: 'Checking' } })
+      assert.equal(events.some(event => event.type === 'task.progress'
+        && event.text === 'Checking'), true)
+      onEvent({ type: 'backend.task.progress', progress:
+        { category: 'answer', seq: 2, text: 'Done' } })
+      onEvent({ type: 'backend.task.progress', progress:
+        { category: 'answer', seq: 2, text: 'duplicate' } })
+      return { content: 'Done' }
+    } })
+  await manager.wait(task.id)
+  assert.deepEqual(events.filter(event => event.text).map(event => event.seq), [1, 2])
+  assert.equal(events.filter(event => event.type === 'task.completed').length, 1)
+  assert.equal(latencies.length, 1)
+  assert.equal(latencies[0].status, 'completed')
+  assert.equal(latencies[0].firstStatusMs, 0)
+  assert.equal(typeof latencies[0].firstContentDeltaMs, 'number')
+  assert.equal(typeof latencies[0].firstAnswerDeltaMs, 'number')
+  assert.equal(typeof latencies[0].terminalMs, 'number')
+})
+
+test('records a no-delta failure once with null content and answer latency', async () => {
+  const latencies = []
+  const events = []
+  const manager = new TaskManager({ logger: recordingLogger(latencies) })
+  manager.subscribe(event => events.push(event))
+  const task = manager.create({ objective: 'fail', ownerId: 'owner',
+    runner: async () => { throw new Error('fixture failure') } })
+  await manager.wait(task.id)
+  assert.equal(manager.get(task.id).status, 'failed')
+  assert.equal(events.filter(event => event.type === 'task.failed').length, 1)
+  assert.equal(latencies.length, 1)
+  assert.deepEqual({
+    status: latencies[0].status,
+    firstStatusMs: latencies[0].firstStatusMs,
+    firstContentDeltaMs: latencies[0].firstContentDeltaMs,
+    firstAnswerDeltaMs: latencies[0].firstAnswerDeltaMs,
+  }, {
+    status: 'failed', firstStatusMs: 0,
+    firstContentDeltaMs: null, firstAnswerDeltaMs: null,
+  })
+  assert.equal(typeof latencies[0].terminalMs, 'number')
+})
+
+test('records running cancellation terminal latency and emits cancelled once', async () => {
+  const latencies = []
+  const events = []
+  const manager = new TaskManager({ logger: recordingLogger(latencies) })
+  manager.subscribe(event => events.push(event))
+  const task = manager.create({ objective: 'cancel', ownerId: 'owner',
+    runner: async (_objective, { onEvent, signal }) => {
+      onEvent({ type: 'backend.task.progress', progress:
+        { category: 'progress', seq: 1, text: 'Working' } })
+      await new Promise((resolve, reject) => signal.addEventListener(
+        'abort', () => reject(signal.reason), { once: true }))
+    } })
+  await new Promise(resolve => setImmediate(resolve))
+  await manager.cancel(task.id, { ownerId: 'owner' })
+  assert.equal(events.filter(event => event.type === 'task.cancelled').length, 1)
+  assert.equal(latencies.length, 1)
+  assert.equal(latencies[0].status, 'cancelled')
+  assert.equal(typeof latencies[0].firstContentDeltaMs, 'number')
+  assert.equal(latencies[0].firstAnswerDeltaMs, null)
+  assert.equal(typeof latencies[0].terminalMs, 'number')
+})
+
 test('forwards backend text chunks as ordered non-persistent task events', async () => {
   const manager = new TaskManager()
   const chunks = []
