@@ -34,12 +34,23 @@ export class TaskStreamProtocol {
     this.now = now
     this.progressWindowMs = Math.max(0, progressWindowMs)
     this.streams = new Map()
+    this.terminalGenerations = new Map()
     this.closed = false
   }
 
   state(value) {
     const identity = normalizedIdentity(value)
     const key = streamKey(identity)
+    const terminalGeneration = this.terminalGenerations.get(key)
+    if (terminalGeneration !== undefined && identity.generation <= terminalGeneration) {
+      this.drop(
+        identity.generation === terminalGeneration
+          ? 'after_terminal' : 'stale_generation',
+        identity,
+        { terminalGeneration },
+      )
+      return null
+    }
     const current = this.streams.get(key)
     if (current && identity.generation < current.identity.generation) {
       this.drop('stale_generation', identity, { activeGeneration: current.identity.generation })
@@ -142,6 +153,7 @@ export class TaskStreamProtocol {
       metrics: this.metrics(state),
     })
     state.terminalSent = true
+    this.terminalGenerations.set(state.key, state.identity.generation)
     this.log.info?.('task.stream.terminal', {
       ...state.identity, ...this.metrics(state), status: state.taskTerminal.status,
     })
@@ -155,6 +167,7 @@ export class TaskStreamProtocol {
       this.drop(reason, state.identity, { disconnectAtMs: this.now() - state.startedAt })
     }
     this.streams.clear()
+    this.terminalGenerations.clear()
   }
 
   metrics(state) {

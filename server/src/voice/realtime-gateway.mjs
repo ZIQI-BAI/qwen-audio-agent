@@ -157,6 +157,10 @@ export function sendTaskEvent(ws, event = {}) {
   })
 }
 
+export function isPublicTaskStream(task, sessionId) {
+  return task?.kind !== 'control' && task?.sessionId === sessionId
+}
+
 const PUBLIC_RESPONSE_ORIGINS = new Set([
   'model',
   'agent',
@@ -1027,10 +1031,11 @@ export function attachRealtimeGateway(server, {
     const unsubscribeTasks = taskManager.subscribe(event => {
       const task = event.task
       if (event.ownerId !== ownerId) return
+      const publicTaskStream = isPublicTaskStream(task, sessionId)
       if (event.type === 'task.stream.chunk') {
         if (
           !config.codexSpeechStreaming
-          || task.sessionId !== sessionId
+          || !publicTaskStream
         ) return
         streamedTaskIds.add(task.id)
         taskStreamProtocol.text(
@@ -1060,7 +1065,7 @@ export function attachRealtimeGateway(server, {
       }
       if (
         ['task.cancelling', 'task.cancelled'].includes(event.type)
-        && task.sessionId === sessionId
+        && publicTaskStream
       ) {
         const cancellationIdentity = streamIdentity(
           task, task.streamGeneration || 1,
@@ -1071,7 +1076,7 @@ export function attachRealtimeGateway(server, {
         }
         taskStreamProtocol.cancel(cancellationIdentity, event.type)
       }
-      if (event.type === 'task.running' && task.sessionId === sessionId) {
+      if (event.type === 'task.running' && publicTaskStream) {
         taskStreamProtocol.progress(
           streamIdentity(task, task.streamGeneration || 1),
           'running',
@@ -1079,7 +1084,7 @@ export function attachRealtimeGateway(server, {
         )
       }
       if (event.type === 'task.progress.check') {
-        if (task.sessionId !== sessionId) return
+        if (!publicTaskStream) return
         taskStreamProtocol.progress(
           streamIdentity(task, task.streamGeneration || 1),
           event.message,

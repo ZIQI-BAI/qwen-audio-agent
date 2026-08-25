@@ -94,6 +94,28 @@ test('cancel closes its own barrier without affecting foreground or announcement
   assert.equal(frames.filter(frame => frame.category === 'terminal').length, 1)
 })
 
+test('cancelling then cancelled emits exactly one terminal without resetting sequence', () => {
+  const { protocol, frames, logs } = fixture()
+  protocol.progress(identity, 'running')
+  assert.equal(protocol.cancel(identity, 'task.cancelling'), true)
+  assert.equal(protocol.cancel(identity, 'task.cancelled'), false)
+
+  const terminals = frames.filter(frame => frame.category === 'terminal')
+  assert.equal(terminals.length, 1)
+  assert.equal(terminals[0].seq, 0)
+  assert.equal(terminals[0].reason, 'task.cancelling')
+  assert.ok(logs.some(item => item.fields.reason === 'after_terminal'))
+})
+
+test('a newer generation may start after an older generation reached terminal', () => {
+  const { protocol, frames } = fixture()
+  protocol.cancel(identity)
+  protocol.text({ ...identity, generation: 3 }, 'new generation')
+  assert.equal(frames.at(-1).generation, 3)
+  assert.equal(frames.at(-1).category, 'text')
+  assert.equal(frames.at(-1).seq, 0)
+})
+
 test('socket close records disconnect point and rejects later frames', () => {
   const { protocol, frames, logs, advance } = fixture()
   protocol.progress(identity, 'started')
