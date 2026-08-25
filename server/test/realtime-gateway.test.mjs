@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   acceptsPlaybackReceipt,
   cancelInterruptedTurnTasks,
+  claimSessionNotifications,
   confirmsTaskNotificationOnPlaybackStart,
   publicResponseDoneEvent,
   rejectUnsupportedRealtimeUpgrade,
@@ -57,6 +58,24 @@ test('confirms task notifications when client playback starts', () => {
   assert.equal(confirmsTaskNotificationOnPlaybackStart({
     origin: 'model',
   }), false)
+})
+
+test('a new realtime session never claims persisted announcements from other sessions', () => {
+  let query
+  const claimed = claimSessionNotifications({
+    claimNotifications(value) {
+      query = value
+      return [{ id: 'owned-task' }]
+    },
+  }, {
+    ownerId: 'owner-1', sessionId: 'new-watch-session',
+    claimantId: 'voice-1', taskIds: undefined,
+  })
+  assert.deepEqual(claimed, [{ id: 'owned-task' }])
+  assert.deepEqual(query, {
+    ownerId: 'owner-1', sessionId: 'new-watch-session',
+    includeOtherSessions: false, claimantId: 'voice-1', taskIds: undefined,
+  })
 })
 
 test('accepts playback receipts only from the active output client for a known response', () => {
