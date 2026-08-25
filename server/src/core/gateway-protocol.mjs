@@ -16,7 +16,7 @@
 // desktop.settings-window, …) are not part of this contract, and a removed
 // capability is a breaking change. Hosts migrating from the fork must branch
 // on the capability list below, never on the version number.
-export const GATEWAY_PROTOCOL_VERSION = '2.0.0'
+export const GATEWAY_PROTOCOL_VERSION = '2.1.0'
 
 export const GATEWAY_CAPABILITIES = Object.freeze([
   // The Gateway statically hosts web/dist at its own origin, so a client may
@@ -55,6 +55,9 @@ export const GATEWAY_CAPABILITIES = Object.freeze([
   'input.suspend-ttl',
   // Clients confirm a suspension with input.suspend.ack.
   'input.suspend-ack',
+  // Versioned task.stream frames preserve task/request/session/generation and
+  // keep progress, text, audio and terminal sequence spaces independent.
+  'task.incremental-stream-v1',
   // The orb shell contract ships: qwen-audio-agent/orb/preload plus
   // orb/main's bindOrbShell, so a host may run the floating orb form.
   'desktop.orb-shell',

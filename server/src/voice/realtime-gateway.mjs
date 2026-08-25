@@ -26,6 +26,7 @@ import { TurnCorrelation } from './turn-correlation.mjs'
 import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
 import { CodexStreamProjector } from './codex-stream-projector.mjs'
+import { TaskStreamProtocol } from './task-stream-protocol.mjs'
 import { StreamingLatencyWindow } from './streaming-latency-window.mjs'
 import {
   ensureResponseContext,
@@ -71,9 +72,10 @@ const REALTIME_STABLE_CONNECTION_MS = 10000
 function send(ws, event, onFlush) {
   if (ws.readyState !== WebSocket.OPEN) {
     onFlush?.(new Error('socket_not_open'))
-    return
+    return false
   }
   ws.send(JSON.stringify(event), onFlush)
+  return true
 }
 
 function rejectUpgrade(socket, status, message) {
@@ -153,6 +155,10 @@ export function sendTaskEvent(ws, event = {}) {
     task: event.task,
     ...(event.permission ? { permission: event.permission } : {}),
   })
+}
+
+export function isPublicTaskStream(task, sessionId) {
+  return task?.kind !== 'control' && task?.sessionId === sessionId
 }
 
 const PUBLIC_RESPONSE_ORIGINS = new Set([
@@ -348,9 +354,14 @@ export function attachRealtimeGateway(server, {
     const streamingLatency = new StreamingLatencyWindow({ maxSamples: 100 })
     const streamIdentity = (task, generation = 1) => ({
       requestId: task.id,
+      sessionId,
       turnId: task.turnId || null,
       taskId: task.id,
       generation,
+    })
+    const taskStreamProtocol = new TaskStreamProtocol({
+      send: frame => send(ws, frame),
+      log: connectionLogger,
     })
     const codexStreamProjector = new CodexStreamProjector({
       speak: (text, context) => frontend.speak(text, 'agent', {
@@ -359,20 +370,32 @@ export function attachRealtimeGateway(server, {
         streamSequence: context.sequence,
         streamSegmentStartedAt: Date.now(),
       }),
-      onSegment: segment => send(ws, {
-        type: 'task.stream.segment',
-        taskId: segment.taskId,
-        turnId: segment.turnId,
-        sequence: segment.sequence,
-        text: segment.text,
-      }),
-      onDone: result => send(ws, {
-        type: result.aborted ? 'task.stream.aborted' : 'task.stream.done',
-        taskId: result.taskId,
-        turnId: result.turnId,
-        final_sequence: result.final_sequence,
-        streaming_fallback_reason: result.streaming_fallback_reason,
-      }),
+      onSegment: segment => {
+        taskStreamProtocol.audio(segment, {
+          segmentSequence: segment.sequence,
+          text: segment.text,
+        })
+        send(ws, {
+          type: 'task.stream.segment',
+          taskId: segment.taskId,
+          turnId: segment.turnId,
+          sequence: segment.sequence,
+          text: segment.text,
+        })
+      },
+      onDone: result => {
+        taskStreamProtocol.responseDone(result, {
+          finalAudioSequence: result.final_sequence,
+          streamingFallbackReason: result.streaming_fallback_reason,
+        })
+        send(ws, {
+          type: result.aborted ? 'task.stream.aborted' : 'task.stream.done',
+          taskId: result.taskId,
+          turnId: result.turnId,
+          final_sequence: result.final_sequence,
+          streaming_fallback_reason: result.streaming_fallback_reason,
+        })
+      },
       onFallback: result => {
         connectionLogger.warn('task.streaming_fallback', result)
         send(ws, {
@@ -1008,12 +1031,17 @@ export function attachRealtimeGateway(server, {
     const unsubscribeTasks = taskManager.subscribe(event => {
       const task = event.task
       if (event.ownerId !== ownerId) return
+      const publicTaskStream = isPublicTaskStream(task, sessionId)
       if (event.type === 'task.stream.chunk') {
         if (
           !config.codexSpeechStreaming
-          || task.sessionId !== sessionId
+          || !publicTaskStream
         ) return
         streamedTaskIds.add(task.id)
+        taskStreamProtocol.text(
+          streamIdentity(task, event.generation),
+          event.chunk,
+        )
         if (!outputEnabled || !frontend?.ready) {
           codexStreamProjector.fallback(
             streamIdentity(task, event.generation),
@@ -1037,16 +1065,31 @@ export function attachRealtimeGateway(server, {
       }
       if (
         ['task.cancelling', 'task.cancelled'].includes(event.type)
-        && streamedTaskIds.has(task.id)
+        && publicTaskStream
       ) {
-        codexStreamProjector.abort(
-          streamIdentity(task, task.streamGeneration || 1),
-          event.type,
+        const cancellationIdentity = streamIdentity(
+          task, task.streamGeneration || 1,
         )
-        streamedTaskIds.delete(task.id)
+        if (streamedTaskIds.has(task.id)) {
+          codexStreamProjector.abort(cancellationIdentity, event.type)
+          streamedTaskIds.delete(task.id)
+        }
+        taskStreamProtocol.cancel(cancellationIdentity, event.type)
+      }
+      if (event.type === 'task.running' && publicTaskStream) {
+        taskStreamProtocol.progress(
+          streamIdentity(task, task.streamGeneration || 1),
+          'running',
+          { status: 'running' },
+        )
       }
       if (event.type === 'task.progress.check') {
-        if (task.sessionId !== sessionId) return
+        if (!publicTaskStream) return
+        taskStreamProtocol.progress(
+          streamIdentity(task, task.streamGeneration || 1),
+          event.message,
+          { delegated: event.delegated === true },
+        )
         if (!outputEnabled || !frontend?.ready) return
         const progressContext = {
           taskId: task.id,
@@ -1162,6 +1205,15 @@ export function attachRealtimeGateway(server, {
       }
       if (['task.completed', 'task.failed'].includes(event.type)) {
         const wasStreamed = streamedTaskIds.has(task.id)
+        const terminalIdentity = streamIdentity(
+          task, task.streamGeneration || 1,
+        )
+        taskStreamProtocol.taskDone(
+          terminalIdentity,
+          event.type === 'task.completed' ? 'completed' : 'failed',
+          event.type === 'task.failed' ? { error: task.error || null } : {},
+        )
+        if (!wasStreamed) taskStreamProtocol.responseDone(terminalIdentity)
         if (wasStreamed) {
           void codexStreamProjector.terminal(streamIdentity(
             task,
@@ -2483,6 +2535,7 @@ export function attachRealtimeGateway(server, {
       connections?.delete(voiceClient)
       if (!connections?.size) voiceConnections.delete(ownerId)
       unsubscribeTasks()
+      taskStreamProtocol.close('socket_closed')
       clearResponseCandidate()
       turnGeneration = ++turnSequence
       committedTurnGeneration = turnGeneration

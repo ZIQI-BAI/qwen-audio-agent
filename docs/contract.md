@@ -18,7 +18,7 @@ a feature then degrades instead of failing.
 Versioning follows SemVer: the minor rises for an additive capability, the
 major for a breaking change to any endpoint or event named below.
 
-The current version is `2.0.0`. It succeeds the `1.x` line of the
+The current version is `2.1.0`. It succeeds the `1.x` line of the
 `feat/embedded-gateway-host-contract` fork (which ended at `1.7.0`): the major
 bump records that capabilities that line advertised — such as
 `gateway.embedded-lifecycle` and `desktop.settings-window` — are not part of
@@ -38,6 +38,7 @@ below instead of assuming the old list.
 | `input.suspend-clears-playback` | Suspending also clears playback so host recording stays clean | `server/test/input-suspend-protocol.test.mjs` |
 | `input.suspend-ttl` | A suspension expires on its own when the holder never resumes | `server/test/input-arbitration.test.mjs` |
 | `input.suspend-ack` | Clients confirm a suspension with `input.suspend.ack` (status display only — never wait for it) | `server/test/input-suspend-protocol.test.mjs` |
+| `task.incremental-stream-v1` | `task.stream` publishes versioned, correlated progress/text/audio frames with independent category sequence numbers; terminal waits for task and response/audio barriers | `server/test/task-stream-protocol.test.mjs` |
 | `desktop.orb-shell` | The orb form's main-process contract ships: `bindOrbShell` answers the channels the shipped preload sends | `desktop/test/orb-shell.test.mjs` |
 | `desktop.orb-window-factory` | `createOrbWindow` owns the orb window recipe; its `destroy()` is the host's synchronous teardown path (renderer exit is what releases the microphone) | `desktop/test/orb-window.test.mjs` |
 | `desktop.orb-placement` | `createOrbPlacement` covers the default anchor, display clamping and drop persistence | `desktop/test/orb-placement.test.mjs` |

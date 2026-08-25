@@ -5,6 +5,7 @@ import {
   cancelInterruptedTurnTasks,
   claimSessionNotifications,
   confirmsTaskNotificationOnPlaybackStart,
+  isPublicTaskStream,
   publicResponseDoneEvent,
   rejectUnsupportedRealtimeUpgrade,
   sendTaskEvent,
@@ -117,6 +118,22 @@ test('forwards a streamed task cancellation event to the client', () => {
   sendTaskEvent(ws, event)
 
   assert.deepEqual(messages, [event])
+})
+
+test('control tasks are excluded from every public stream lifecycle event', () => {
+  const control = { id: 'control-1', kind: 'control', sessionId: 'session-1' }
+  const ordinary = { id: 'work-1', kind: 'work', sessionId: 'session-1' }
+  const lifecycle = [
+    'task.running', 'task.progress.check', 'task.cancelling',
+    'task.cancelled', 'task.completed',
+  ]
+  const projected = []
+  for (const type of lifecycle) {
+    if (isPublicTaskStream(control, 'session-1')) projected.push(type)
+  }
+  assert.deepEqual(projected, [])
+  assert.equal(isPublicTaskStream(ordinary, 'session-1'), true)
+  assert.equal(isPublicTaskStream(ordinary, 'session-2'), false)
 })
 
 test('interrupt cancels only active work owned by the interrupted turn', async () => {
