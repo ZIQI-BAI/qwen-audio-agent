@@ -2,6 +2,27 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TaskManager } from '../src/task/task-manager.mjs'
 
+test('publishes content progress immediately, in order, and terminal once', async () => {
+  const manager = new TaskManager()
+  const events = []
+  manager.subscribe(event => events.push(event))
+  const task = manager.create({ objective: 'stream', ownerId: 'owner', runner:
+    async (_objective, { onEvent }) => {
+      onEvent({ type: 'backend.task.progress', progress:
+        { category: 'reasoning', seq: 1, text: 'Checking' } })
+      assert.equal(events.some(event => event.type === 'task.progress'
+        && event.text === 'Checking'), true)
+      onEvent({ type: 'backend.task.progress', progress:
+        { category: 'answer', seq: 2, text: 'Done' } })
+      onEvent({ type: 'backend.task.progress', progress:
+        { category: 'answer', seq: 2, text: 'duplicate' } })
+      return { content: 'Done' }
+    } })
+  await manager.wait(task.id)
+  assert.deepEqual(events.filter(event => event.text).map(event => event.seq), [1, 2])
+  assert.equal(events.filter(event => event.type === 'task.completed').length, 1)
+})
+
 test('forwards backend text chunks as ordered non-persistent task events', async () => {
   const manager = new TaskManager()
   const chunks = []

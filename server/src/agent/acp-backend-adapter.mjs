@@ -11,6 +11,7 @@ import {
   coordinatorPresentation,
   nativeToolOutput,
   normalizeCoordinatorContent,
+  progressFromUpdate,
   projectSessionKey,
   sessionSummary,
 } from './acp-backend-session-utils.mjs'
@@ -701,6 +702,9 @@ export class AcpBackendAdapter {
 
   onSessionUpdate(run, update, { stream = false } = {}) {
     run.receivedUpdate = true
+    run.progressState ||= {}
+    const progress = progressFromUpdate(update, run.progressState)
+    if (progress) run.onEvent?.({ type: 'backend.task.progress', progress })
     if (
       stream
       && this.profile.streamDelegatedText === true

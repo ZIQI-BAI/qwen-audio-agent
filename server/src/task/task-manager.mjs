@@ -594,17 +594,36 @@ export class TaskManager {
   start(task) {
     task.status = 'running'
     task.startedAt = Date.now()
+    task.firstStatusAt = task.startedAt
     task.abortController = new AbortController()
     this.scheduler.acquire(task)
     task.schedulerHeld = true
     this.emit('task.running', task)
     task.progressTimer = setInterval(() => {
       if (ACTIVE.has(task.status)) {
-        this.emit('task.progress', task, { persist: false })
+        this.emit('task.progress', task, { persist: false, heartbeat: true })
       }
     }, 1000)
     task.progressTimer.unref?.()
     const onEvent = event => {
+      if (event?.type === 'backend.task.progress' && event.progress) {
+        const progress = event.progress
+        if (!Number.isInteger(progress.seq)
+          || progress.seq <= (task.lastProgressSeq || 0)) return
+        task.lastProgressSeq = progress.seq
+        const now = Date.now()
+        task.firstStatusAt ||= now
+        task.firstContentDeltaAt ||= now
+        if (progress.category === 'answer') task.firstAnswerDeltaAt ||= now
+        this.emit('task.progress', task, {
+          persist: false,
+          heartbeat: false,
+          category: progress.category,
+          seq: progress.seq,
+          text: progress.text,
+        })
+        return
+      }
       if (event?.type === 'backend.permission.requested' && event.permission) {
         task.authorization = { ...event.permission }
         this.emit('task.permission.requested', task)
@@ -819,6 +838,17 @@ export class TaskManager {
           : 0
         task.notificationStatus = 'pending'
         task.terminalHandled = true
+        this.logger?.info('task.stream_latency', {
+          taskId: task.id,
+          startMs: task.startedAt - task.createdAt,
+          firstStatusMs: task.firstStatusAt
+            ? task.firstStatusAt - task.startedAt : null,
+          firstContentDeltaMs: task.firstContentDeltaAt
+            ? task.firstContentDeltaAt - task.startedAt : null,
+          firstAnswerDeltaMs: task.firstAnswerDeltaAt
+            ? task.firstAnswerDeltaAt - task.startedAt : null,
+          terminalMs: task.completedAt - task.startedAt,
+        })
         if (task.schedulerHeld) {
           this.scheduler.release(task)
           task.schedulerHeld = false

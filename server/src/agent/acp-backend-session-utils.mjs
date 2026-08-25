@@ -6,6 +6,49 @@ function bounded(value, max = 300) {
   return clean(value).replace(/\s+/g, ' ').slice(0, max)
 }
 
+const SENSITIVE = /(?:system[_ -]?prompt|hidden[_ -]?context|api[_ -]?key|access[_ -]?token|authorization|cookie|secret|password|private[_ -]?key)/i
+
+function safeText(value, max = 4_000) {
+  const text = typeof value === 'string' ? value : ''
+  if (!text || SENSITIVE.test(text)) return ''
+  return text
+    .replace(/<\/?(?:system|developer|hidden_context)\b[^>]*>/gi, '')
+    .slice(0, max)
+}
+
+/** Project only explicit ACP output. It never synthesizes model reasoning. */
+export function progressFromUpdate(update, state = {}) {
+  const sourceSeq = Number(update?.seq ?? update?.sequence)
+  if (Number.isFinite(sourceSeq)) {
+    if (sourceSeq <= (state.sourceSeq ?? -1)) return null
+    state.sourceSeq = sourceSeq
+  }
+  const kind = clean(update?.sessionUpdate)
+  let category = ''
+  let text = ''
+  if (kind === 'agent_thought_chunk' || kind === 'reasoning_chunk') {
+    category = 'reasoning'
+    text = safeText(update?.content?.text)
+  } else if (kind === 'agent_message_chunk') {
+    category = 'answer'
+    text = safeText(update?.content?.text)
+  } else if (kind === 'plan') {
+    category = 'progress'
+    const entries = Array.isArray(update.entries) ? update.entries : []
+    text = safeText(entries.find(entry => entry?.status === 'in_progress')?.content
+      || entries.find(entry => entry?.status === 'pending')?.content)
+  } else if (['tool_call', 'tool_call_update'].includes(kind)) {
+    category = 'tool'
+    text = safeText(update.title || update.name || update.status, 500)
+  }
+  if (!category || !text) return null
+  state.seq = (state.seq ?? 0) + 1
+  const fingerprint = `${category}:${text}`
+  if (fingerprint === state.fingerprint) return null
+  state.fingerprint = fingerprint
+  return { category, seq: state.seq, text }
+}
+
 export function coordinatorKey(ownerId, protocol) {
   return `${protocol}:${encodeURIComponent(clean(ownerId) || 'personal')}:backend`
 }
