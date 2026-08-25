@@ -52,6 +52,7 @@ export const GatewayServerEvent = Object.freeze({
 })
 
 export const GatewayTaskEvent = Object.freeze({
+  STREAM: 'task.stream',
   SCHEDULED: 'task.scheduled',
   SCHEDULED_FIRED: 'task.scheduled.fired',
   RUNNING: 'task.running',
