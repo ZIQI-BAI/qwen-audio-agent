@@ -127,6 +127,18 @@ export function cancelInterruptedTurnTasks({
   return tasks.map(task => task.id)
 }
 
+export function claimSessionNotifications(taskManager, {
+  ownerId, sessionId, claimantId, taskIds,
+}) {
+  return taskManager.claimNotifications({
+    ownerId,
+    sessionId,
+    includeOtherSessions: false,
+    claimantId,
+    taskIds,
+  })
+}
+
 export function acceptsPlaybackReceipt({
   outputEnabled,
   active,
@@ -977,17 +989,15 @@ export function attachRealtimeGateway(server, {
       timer.unref?.()
     }
 
-    const claimPendingNotifications = (
-      taskIds,
-      { includeOtherSessions = !taskIds?.length } = {},
-    ) => {
+    const claimPendingNotifications = (taskIds) => {
       if (!outputEnabled || !frontend?.ready) return
-      const claimed = taskManager.claimNotifications({
-        ownerId,
-        sessionId,
-        includeOtherSessions,
-        claimantId: notificationClaimantId,
-        taskIds,
+      // A realtime socket is a session-scoped delivery surface. Replaying
+      // another session's persisted notification here can seize the single
+      // voice slot before this socket's first user input and make the model
+      // silently discard that input. Cross-session results remain persisted
+      // and available to their owning session/offline notification surface.
+      const claimed = claimSessionNotifications(taskManager, {
+        ownerId, sessionId, claimantId: notificationClaimantId, taskIds,
       })
       claimed.forEach(task => {
         recordResult(task)
