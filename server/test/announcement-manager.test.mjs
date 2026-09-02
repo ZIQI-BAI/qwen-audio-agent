@@ -425,3 +425,50 @@ test('releases a poison batch after bounded retries so later results can proceed
   manager.confirmMany(['healthy'])
   manager.close()
 })
+
+test('routes a task result back into its originating foreground turn', async () => {
+  const calls = []
+  const manager = new AnnouncementManager({
+    getFrontend: () => ({
+      ready: true,
+      injectResult: async (text, origin, context) => {
+        calls.push({ text, origin, context })
+        return { completed: true, contextInjected: true }
+      },
+    }),
+    isDeliveryBlocked: () => false,
+    batchWindowMs: 0,
+  })
+  manager.completed({
+    id: 'task-origin', status: 'completed', objective: '查询天气',
+    result: '杭州晴', turnId: 'turn-7', turnGeneration: 7,
+    completedAt: Date.now(),
+  })
+  await waitFor(() => calls.length === 1)
+  assert.equal(calls[0].origin, 'agent')
+  assert.equal(calls[0].context.turnId, 'turn-7')
+  assert.equal(calls[0].context.turnGeneration, 7)
+  assert.equal(calls[0].context.consumesTaskNotification, true)
+  manager.close()
+})
+
+test('keeps cross-turn result batches isolated as announcements', async () => {
+  const calls = []
+  const manager = new AnnouncementManager({
+    getFrontend: () => ({
+      ready: true,
+      injectResult: async (_text, origin, context) => {
+        calls.push({ origin, context })
+        return { completed: true, contextInjected: true }
+      },
+    }),
+    isDeliveryBlocked: () => false,
+    batchWindowMs: 5,
+  })
+  manager.completed({ id: 'a', status: 'completed', objective: 'A', result: 'A', turnId: 'turn-a', turnGeneration: 1 })
+  manager.completed({ id: 'b', status: 'completed', objective: 'B', result: 'B', turnId: 'turn-b', turnGeneration: 2 })
+  await waitFor(() => calls.length === 1)
+  assert.equal(calls[0].origin, 'announcement')
+  assert.equal(calls[0].context.turnId, null)
+  manager.close()
+})

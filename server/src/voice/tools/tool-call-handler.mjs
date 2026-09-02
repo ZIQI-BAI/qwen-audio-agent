@@ -250,6 +250,7 @@ export class ToolCallHandler {
 
   createWork({
     turnId,
+    turnGeneration,
     objective,
     verbatimRequest,
     submissionKey,
@@ -261,6 +262,7 @@ export class ToolCallHandler {
       ownerId: this.ownerId,
       sessionId: this.sessionId,
       turnId,
+      turnGeneration,
       submissionKey,
       laneKey: `coordinator:${this.ownerId}`,
       laneLimit: 1,
@@ -621,6 +623,7 @@ export class ToolCallHandler {
       )
       task = this.createWork({
         turnId,
+        turnGeneration: generation,
         objective,
         verbatimRequest,
         submissionKey,

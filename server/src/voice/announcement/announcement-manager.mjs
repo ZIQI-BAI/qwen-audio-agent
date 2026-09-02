@@ -64,6 +64,7 @@ export class AnnouncementManager {
       objective: task.objective,
       result: task.result,
       turnId: task.turnId,
+      turnGeneration: task.turnGeneration,
       completedAt: task.completedAt,
     })
   }
@@ -75,6 +76,7 @@ export class AnnouncementManager {
       objective: task.objective,
       error: task.error,
       turnId: task.turnId,
+      turnGeneration: task.turnGeneration,
       completedAt: task.completedAt,
     })
   }
@@ -258,6 +260,9 @@ export class AnnouncementManager {
       // acknowledged when playback ends. Remaining events stay pending.
       taskIds: queued.map(item => item.taskId),
       turnIds: announcements.map(item => item.turnId).filter(Boolean),
+      turnGenerations: announcements
+        .map(item => item.turnGeneration)
+        .filter(Number.isInteger),
       deliverySequence: queued[0].sequence,
       contextInjected: false,
       responseCompleted: false,
@@ -292,19 +297,25 @@ export class AnnouncementManager {
       )
       const context = {
         turnId: batch.turnIds.length === 1 ? batch.turnIds[0] : null,
+        turnGeneration: batch.turnIds.length === 1
+          && batch.turnGenerations.length === 1
+          ? batch.turnGenerations[0] : null,
         turnIds: batch.turnIds,
         taskId: batch.taskIds.length === 1 ? batch.taskIds[0] : null,
         taskIds: batch.taskIds,
         deliverySequence: batch.deliverySequence,
+        consumesTaskNotification: true,
       }
+      const origin = context.turnId && Number.isInteger(context.turnGeneration)
+        ? 'agent' : 'announcement'
       const outcome = this.announceIntoContext && frontend.injectResult
         ? await frontend.injectResult(
             eventText,
-            'announcement',
+            origin,
             context,
             { injectContext: !batch.contextInjected },
           )
-        : await frontend.speak(eventText, 'announcement', context)
+        : await frontend.speak(eventText, origin, context)
       if (
         this.deliveryGeneration !== deliveryGeneration
         || this.activeBatch !== batch
