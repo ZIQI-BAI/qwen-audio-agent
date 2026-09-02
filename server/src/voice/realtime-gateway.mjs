@@ -1218,10 +1218,25 @@ export function attachRealtimeGateway(server, {
         }
       }
       if (['task.completed', 'task.failed'].includes(event.type)) {
-        const wasStreamed = streamedTaskIds.has(task.id)
+        let wasStreamed = streamedTaskIds.has(task.id)
         const terminalIdentity = streamIdentity(
           task, task.streamGeneration || 1,
         )
+        // Some ACP backends only publish a final task result and never emit
+        // task.stream.chunk. Treat that final result as the last content
+        // increment instead of completing the protocol before the result
+        // response has even started. This keeps terminal behind the same
+        // response/audio drain barrier used by genuinely incremental tasks.
+        const finalSpeech = event.type === 'task.completed'
+          ? String(task.resultMetadata?.presentation?.speech || task.result || '').trim()
+          : ''
+        if (!wasStreamed && finalSpeech) {
+          taskStreamProtocol.text(terminalIdentity, finalSpeech)
+          if (outputEnabled && frontend?.ready) {
+            codexStreamProjector.push(terminalIdentity, finalSpeech)
+            wasStreamed = true
+          }
+        }
         taskStreamProtocol.taskDone(
           terminalIdentity,
           event.type === 'task.completed' ? 'completed' : 'failed',
