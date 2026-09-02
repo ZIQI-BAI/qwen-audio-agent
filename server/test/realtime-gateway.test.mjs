@@ -6,6 +6,7 @@ import {
   claimSessionNotifications,
   confirmsTaskNotificationOnPlaybackStart,
   isPublicTaskStream,
+  manualAudioCommitContext,
   publicResponseDoneEvent,
   rejectUnsupportedRealtimeUpgrade,
   sendTaskEvent,
@@ -16,6 +17,23 @@ import { GatewayClientEvent } from '../../shared/realtime-events.mjs'
 
 test('exposes audio.commit as a supported gateway client event', () => {
   assert.equal(GatewayClientEvent.AUDIO_COMMIT, 'audio.commit')
+})
+
+test('manual audio commit starts a stable turn before provider transcription events', () => {
+  assert.deepEqual(manualAudioCommitContext({
+    manualTurnDetection: true,
+    turnSequence: 4,
+    now: 1234,
+  }), {
+    turnId: 'voice-1234-5',
+    turnGeneration: 5,
+    turnSequence: 5,
+  })
+  assert.equal(manualAudioCommitContext({
+    manualTurnDetection: false,
+    turnSequence: 4,
+    now: 1234,
+  }), null)
 })
 
 test('closes websocket upgrades outside the realtime endpoint', () => {

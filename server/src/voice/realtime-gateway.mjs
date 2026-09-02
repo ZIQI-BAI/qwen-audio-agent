@@ -141,6 +141,20 @@ export function claimSessionNotifications(taskManager, {
   })
 }
 
+export function manualAudioCommitContext({
+  manualTurnDetection,
+  turnSequence,
+  now = Date.now(),
+}) {
+  if (!manualTurnDetection) return null
+  const turnGeneration = turnSequence + 1
+  return {
+    turnId: `voice-${now}-${turnGeneration}`,
+    turnGeneration,
+    turnSequence: turnGeneration,
+  }
+}
+
 export function acceptsPlaybackReceipt({
   outputEnabled,
   active,
@@ -2451,6 +2465,42 @@ export function attachRealtimeGateway(server, {
         }
       } else if (event.type === GatewayClientEvent.AUDIO_COMMIT) {
         if (!inputEnabled || !activeVoiceClients.isActive(ownerId, voiceClient)) return
+        const manualTurn = manualAudioCommitContext({
+          manualTurnDetection,
+          turnSequence,
+        })
+        if (manualTurn) {
+          turnSequence = manualTurn.turnSequence
+          turnGeneration = manualTurn.turnGeneration
+          turnId = manualTurn.turnId
+          if (pendingInputParts.length) {
+            const attachedParts = inputAssets.registerParts({
+              ownerId,
+              sessionId,
+              turnId,
+              parts: pendingInputParts,
+            })
+            pendingInputParts = []
+            transcripts.recordParts(turnId, attachedParts)
+            frontend?.appendUserInputContext(
+              attachedParts,
+              { accompaniesVoice: true },
+            ).catch(error => send(ws, {
+              type: GatewayServerEvent.ERROR,
+              message: `附件上下文没有成功送达语音前台：${error.message}`,
+            }))
+          }
+          announcementWindow.beginTurn(turnId)
+          announcementWindow.endSpeech()
+          announcements.dismissActive()
+          send(ws, { type: GatewayServerEvent.TURN_STARTED, turnId })
+          send(ws, {
+            type: GatewayServerEvent.VOICE_STATE,
+            state: 'processing',
+            turnId,
+            origin: 'model',
+          })
+        }
         ensureFrontend()
           .then(() => frontend?.commitAudio())
           .catch(error => send(ws, { type: GatewayServerEvent.ERROR, message: error.message }))
