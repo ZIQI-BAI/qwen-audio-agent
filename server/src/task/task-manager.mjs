@@ -67,6 +67,8 @@ function publicTask(task) {
     ownerId: task.ownerId,
     sessionId: task.sessionId,
     turnId: task.turnId,
+    turnGeneration: Number.isInteger(task.turnGeneration)
+      ? task.turnGeneration : null,
     createdAt: task.createdAt,
     startedAt: task.startedAt,
     completedAt: task.completedAt,
@@ -414,6 +416,7 @@ export class TaskManager {
     ownerId,
     sessionId,
     turnId,
+    turnGeneration = null,
     submissionKey,
     laneKey,
     laneLimit = 1,
@@ -442,6 +445,8 @@ export class TaskManager {
       ownerId: normalizedOwnerId,
       sessionId: String(sessionId || 'main'),
       turnId: turnId || null,
+      turnGeneration: Number.isInteger(turnGeneration)
+        ? turnGeneration : null,
       submissionKey: normalizedSubmissionKey || null,
       laneKey: laneKey || null,
       laneLimit,
