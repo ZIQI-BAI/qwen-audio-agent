@@ -69,6 +69,18 @@ followed by `task.stream.done` only after ACP termination and speech drain.
 `task.stream.aborted` closes cancelled streams, and `task.stream.first_audio`
 reports the first segment's start-to-first-frame latency plus the server log's
 bounded 100-sample P95 window.
+
+A task's authoritative final answer is not a segment stream. It is published
+once as a `task.stream` `text` frame carrying the verbatim
+`resultMetadata.presentation.speech`, and spoken as one rendering whose audio
+the Gateway holds until the provider's own transcript matches that text. A
+rendering the model
+rewrote, expanded, truncated or replaced is discarded before any audio is
+forwarded, retried once, and otherwise withheld — reported as
+`task.stream.fallback` with `speech_rewritten` / `speech_expanded` /
+`speech_truncated` / `speech_missing`. The lifecycle terminal and
+`task.stream.done` precede the single `audio.done`, which is the turn's last
+frame.
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`, `listSkins`, `removeSkin`, `effectiveOrbSkin`, `skinsDirectory`, `validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`, `configureOrbWindow`, `ORB_CHANNELS` |

@@ -13,6 +13,10 @@ const CORRELATED_CONTEXT_FIELDS = [
   'consumesTaskNotification',
   'streamSequence',
   'streamSegmentStartedAt',
+  // Present when this response renders a task's authoritative final answer.
+  // Its audio is held until the transcript verifies against this script.
+  'verbatimSpeech',
+  'verbatimAttempt',
 ]
 
 /**

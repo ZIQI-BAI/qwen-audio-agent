@@ -410,6 +410,33 @@ export class RealtimeFrontend {
     })
   }
 
+  /**
+   * Renders `text` as speech without letting the model author it.
+   *
+   * Used for a task's authoritative final answer. The context carries
+   * `verbatimSpeech` so the gateway can hold the produced audio and release it
+   * only after the response transcript is verified against this exact script
+   * (ESS-1165). Providers that do not implement the stricter rendering request
+   * fall back to the ordinary speak request; verification is unchanged.
+   */
+  speakVerbatim(text, origin = 'agent', context = {}, {
+    shouldSpeak,
+  } = {}) {
+    const content = String(text || '').trim()
+    if (!content) return Promise.resolve()
+    const build = typeof this.provider.buildVerbatimSpeechResponse === 'function'
+      ? this.provider.buildVerbatimSpeechResponse
+      : this.provider.buildSpeakResponse
+    return this.enqueueResponse(
+      origin,
+      { ...context, verbatimSpeech: content },
+      () => {
+        if (shouldSpeak && !shouldSpeak()) return false
+        this.send(this.protocol.responseCreate(build(content)))
+      },
+    )
+  }
+
   async injectResult(
     text,
     origin = 'announcement',

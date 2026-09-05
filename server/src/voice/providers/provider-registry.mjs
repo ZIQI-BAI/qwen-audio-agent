@@ -178,6 +178,17 @@ export function validateRealtimeProvider(provider) {
       `Realtime Provider ${provider.key} 的 responseStartTimeoutMs 必须是正数`,
     )
   }
+  // Optional: a stricter rendering request used for a task's authoritative
+  // final answer. Providers without it fall back to buildSpeakResponse, and
+  // the gateway verifies the produced transcript either way.
+  if (
+    provider.buildVerbatimSpeechResponse !== undefined
+    && typeof provider.buildVerbatimSpeechResponse !== 'function'
+  ) {
+    throw new Error(
+      `Realtime Provider ${provider.key} buildVerbatimSpeechResponse 必须是函数`,
+    )
+  }
   if (provider.createProtocol !== undefined) {
     if (typeof provider.createProtocol !== 'function') {
       throw new Error(

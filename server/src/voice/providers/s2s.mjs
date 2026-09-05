@@ -4,6 +4,7 @@ import {
   frontendTools,
   resultResponseInstructions,
   speakResponseInstructions,
+  verbatimSpeechInstructions,
   permissionResponseInstructions,
 } from '../frontend-tools.mjs'
 import { gaRealtimeProtocol } from './ga-protocol.mjs'
@@ -99,6 +100,15 @@ export const s2sProvider = {
     conversation: 'none',
     modalities: ['audio'],
     instructions: speakResponseInstructions(content),
+    tool_choice: 'none',
+  }),
+
+  // Rendering request for a task's authoritative final answer; the produced
+  // transcript is verified against the script before the audio is released.
+  buildVerbatimSpeechResponse: content => ({
+    conversation: 'none',
+    modalities: ['audio'],
+    instructions: verbatimSpeechInstructions(content),
     tool_choice: 'none',
   }),
 

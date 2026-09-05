@@ -201,6 +201,29 @@ export function speakResponseInstructions(content) {
   return `请以自然口语传达下面的信息，保持事实一致，不调用工具：\n${content}`
 }
 
+/**
+ * Rendering-only instruction for a task's authoritative final answer.
+ *
+ * `speakResponseInstructions` invites the model to re-say the content in its
+ * own words, and a real realtime model takes that invitation: ESS-1165
+ * captured it expanding one segment into a whole second answer, and replacing
+ * another answer entirely with progress filler. The final answer is not
+ * something the model is allowed to author, so this instruction addresses it
+ * as a renderer and marks the script with an explicit boundary. The gateway
+ * still verifies the produced transcript against the script — this wording
+ * lowers the divergence rate, it does not guarantee anything.
+ */
+export function verbatimSpeechInstructions(content) {
+  return [
+    '你现在只负责朗读，不是对话参与者。',
+    '把 <speech_script> 与 </speech_script> 之间的内容逐字读出来：不改写、不概括、不扩写、不补充、不省略、不加开场白或结束语。',
+    '不要回应用户、不要描述进度、不要调用工具、不要读出标签本身。',
+    '<speech_script>',
+    content,
+    '</speech_script>',
+  ].join('\n')
+}
+
 export const permissionResponseInstructions = [
   '这是后台 Agent 的权限请求。',
   '自然、简短地说明操作，并询问用户是否同意授权。',

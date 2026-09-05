@@ -30,6 +30,10 @@ import { TaskStreamProtocol } from './task-stream-protocol.mjs'
 import { TaskTerminalDelivery } from './task-terminal-delivery.mjs'
 import { StreamingLatencyWindow } from './streaming-latency-window.mjs'
 import {
+  VERBATIM_SPEECH_ATTEMPTS,
+  verbatimVerdict,
+} from './verbatim-speech.mjs'
+import {
   ensureResponseContext,
   mergeResponseContext,
   responseActivityContextPatch,
@@ -367,6 +371,10 @@ export function attachRealtimeGateway(server, {
     const announcedPermissions = new Set()
     const streamedTaskIds = new Set()
     const streamingLatency = new StreamingLatencyWindow({ maxSamples: 100 })
+    // Verdict of the verbatim check for a response that rendered a task's
+    // final answer, keyed by responseId. Written while `response.done` is
+    // dispatched, read by the awaiting renderer once its outcome settles.
+    const verbatimVerdicts = new Map()
     const streamIdentity = (task, generation = 1) => ({
       requestId: task.id,
       sessionId,
@@ -404,7 +412,13 @@ export function attachRealtimeGateway(server, {
       log: connectionLogger,
     })
     const codexStreamProjector = new CodexStreamProjector({
-      speak: (text, context) => frontend.speak(text, 'agent', {
+      // Incrementally streamed answer segments are answer content too, and the
+      // model drifts on them the same way it drifts on a whole answer
+      // (ESS-1165 saw a projected segment come back as a restated full
+      // answer). They are rendered and verified on the same path; a segment
+      // the model did not read faithfully fails the stream instead of being
+      // spoken.
+      speak: (text, context) => speakStreamSegment(text, {
         turnId: context.turnId,
         taskId: context.taskId,
         streamSequence: context.sequence,
@@ -840,6 +854,17 @@ export function attachRealtimeGateway(server, {
       content,
       final,
     }) => {
+      // An unverified rendering of a task's final answer must not surface as
+      // assistant speech: it may not be the answer at all (ESS-1165). Hold it
+      // with the audio; the release path replays both, the discard path drops
+      // both.
+      if (context?.verbatimSpeech && !context.verbatimReleased) {
+        context.pendingTranscripts = Array.isArray(context.pendingTranscripts)
+          ? context.pendingTranscripts
+          : []
+        context.pendingTranscripts.push({ content, final })
+        return
+      }
       if (final) {
         conversationSync.record({
           ownerId,
@@ -861,7 +886,11 @@ export function attachRealtimeGateway(server, {
     }
 
     const flushPendingTranscripts = (id, context) => {
-      for (const transcript of context?.pendingTranscripts || []) {
+      // Drained before emitting: a still-held verbatim rendering re-queues its
+      // transcripts, and iterating the live array would never terminate.
+      const pending = context?.pendingTranscripts || []
+      if (context) context.pendingTranscripts = []
+      for (const transcript of pending) {
         emitAssistantTranscript({
           id,
           context,
@@ -869,7 +898,198 @@ export function attachRealtimeGateway(server, {
           final: transcript.final,
         })
       }
-      if (context) context.pendingTranscripts = []
+    }
+
+    const isHeldVerbatim = context => Boolean(
+      context?.verbatimSpeech && !context.verbatimReleased,
+    )
+
+    /**
+     * Releases a verified rendering of a task's final answer. Everything the
+     * turn owes the ear is written here, in one place and one order, so the
+     * caller can put the lifecycle terminal ahead of it and keep `audio.done`
+     * as the turn's last frame.
+     */
+    const releaseVerbatimAudio = id => {
+      const context = responseContexts.get(id)
+      if (!context || context.verbatimReleased) return false
+      const held = context.heldAudio || []
+      context.heldAudio = []
+      context.verbatimReleased = true
+      // Playback state for this response is emitted here, not from the
+      // client's playback receipts, which would land after `audio.done`.
+      context.ownsPlaybackState = true
+      const responseTurnId = context.turnId || turnId
+      const origin = context.origin || 'model'
+      if (held.length) {
+        // First-audio latency is measured at release, which is when audio
+        // actually reaches the client: a rendering held for verification and
+        // then discarded never produced any.
+        if (
+          !context.hasAudio
+          && context.streamSegmentStartedAt
+          && context.streamSequence === 0
+        ) {
+          const latencyMs = Math.max(
+            0,
+            Date.now() - context.streamSegmentStartedAt,
+          )
+          const metric = streamingLatency.record(latencyMs)
+          connectionLogger.info('task.streaming_first_audio', {
+            taskId: context.taskId,
+            turnId: context.turnId,
+            sequence: context.streamSequence,
+            ...metric,
+          })
+          send(ws, {
+            type: 'task.stream.first_audio',
+            taskId: context.taskId,
+            sequence: context.streamSequence,
+            latency_ms: latencyMs,
+          })
+        }
+        context.hasAudio = true
+        playbackTurns.set(id, responseTurnId)
+        announcementWindow.queueAudio(id, { turnId: responseTurnId, origin })
+        send(ws, {
+          type: 'voice.state',
+          state: 'speaking',
+          turnId: responseTurnId,
+          origin,
+        })
+        for (const frame of held) {
+          send(ws, {
+            type: 'audio.delta',
+            audio: frame.audio,
+            sampleRate: frame.sampleRate,
+            responseId: id,
+            turnId: responseTurnId,
+          })
+        }
+      }
+      flushPendingTranscripts(id, context)
+      send(ws, { type: 'audio.done', responseId: id, turnId: responseTurnId })
+      return held.length > 0
+    }
+
+    /**
+     * Drops a rendering that did not read the answer it was given. The audio
+     * was never sent, so nothing has to be retracted — the buffers are simply
+     * released and the response context retired.
+     */
+    const discardVerbatimAudio = id => {
+      const context = responseContexts.get(id)
+      if (!context) return
+      context.heldAudio = []
+      context.pendingTranscripts = []
+      context.suppressed = true
+      playbackTurns.delete(id)
+      announcementWindow.finishPlayback(id)
+      responseContexts.delete(id)
+    }
+
+    const settleVerbatimRendering = ({
+      id,
+      context,
+      responseFailed,
+      responseStatus,
+      responseTurnId,
+    }) => {
+      const spoken = context.assistantTranscript || ''
+      // A provider that rendered audio but published no transcript cannot be
+      // checked. That is a provider capability gap, not a divergence: the
+      // audio is released and the gap is logged, rather than silencing the
+      // answer on every such provider. A response with neither audio nor
+      // transcript said nothing and is a plain failure.
+      const unverifiable = !context.transcriptDone
+        && !spoken.trim()
+        && Boolean(context.heldAudio?.length)
+      const verdict = responseFailed
+        ? { ok: false, reason: responseStatus || 'response_failed' }
+        : unverifiable
+          ? { ok: true, reason: null, unverified: true }
+          : verbatimVerdict(context.verbatimSpeech, spoken)
+      verbatimVerdicts.set(id, { ...verdict, spoken })
+      context.responseDone = true
+      connectionLogger[verdict.ok ? 'info' : 'warn'](
+        verdict.ok ? 'task.verbatim_speech_verified' : 'task.verbatim_speech_diverged',
+        {
+          responseId: id,
+          turnId: responseTurnId,
+          taskId: context.taskId || null,
+          attempt: context.verbatimAttempt || 1,
+          reason: verdict.reason || null,
+          unverified: Boolean(verdict.unverified),
+          intendedLength: verdict.intendedLength ?? null,
+          spokenLength: verdict.spokenLength ?? null,
+          spoken: verdict.ok ? undefined : spoken.slice(0, 200),
+        },
+      )
+      const responseDoneEvent = publicResponseDoneEvent({
+        responseId: id,
+        context,
+        status: responseStatus,
+      })
+      if (responseDoneEvent) send(ws, responseDoneEvent)
+      announcementWindow.responseDone({
+        turnId: responseTurnId,
+        origin: context.origin || 'model',
+        hasAudio: verdict.ok && Boolean(context.heldAudio?.length),
+        hasFunctionCall: Boolean(context.hasFunctionCall),
+        suppressed: false,
+        failed: Boolean(responseFailed),
+      })
+      // A verified rendering stays held until the delivery has written its
+      // lifecycle terminal; only then is the audio released.
+      if (!verdict.ok) discardVerbatimAudio(id)
+    }
+
+    /**
+     * Renders `text` as speech and only accepts a rendering that actually said
+     * it. Returns the responseId whose held audio is ready for release, or the
+     * reason speech had to be withheld.
+     *
+     * A diverged attempt costs nothing audible — its audio never left the
+     * gateway — so a bounded retry is worth one more round trip before the
+     * turn gives up on speech (ESS-1165).
+     */
+    const renderVerbatimSpeech = async (text, context) => {
+      let reason = 'speech_not_rendered'
+      for (let attempt = 1; attempt <= VERBATIM_SPEECH_ATTEMPTS; attempt += 1) {
+        if (!outputEnabled || !frontend?.ready) return { reason: 'voice_output_unavailable' }
+        const outcome = await frontend.speakVerbatim(text, 'agent', {
+          ...context,
+          verbatimAttempt: attempt,
+        }).catch(error => ({ failed: true, status: error?.message || 'speech_failed' }))
+        const responseId = outcome?.responseId
+        const verdict = responseId ? verbatimVerdicts.get(responseId) : null
+        if (responseId) verbatimVerdicts.delete(responseId)
+        if (outcome?.completed && verdict?.ok) {
+          return { responseId, unverified: Boolean(verdict.unverified) }
+        }
+        reason = verdict?.reason
+          || outcome?.status
+          || (outcome?.skipped ? 'speech_skipped' : '')
+          || (outcome?.cancelled ? 'speech_cancelled' : '')
+          || 'speech_not_completed'
+        if (responseId) discardVerbatimAudio(responseId)
+        if (outcome?.skipped || outcome?.cancelled) break
+      }
+      return { reason }
+    }
+
+    /**
+     * Speaks one projected answer segment. Unlike the final answer, a segment
+     * releases as soon as it verifies: the next segment is already being
+     * rendered behind it, so there is no later frame to order against.
+     */
+    const speakStreamSegment = async (text, context) => {
+      const rendering = await renderVerbatimSpeech(text, context)
+      if (!rendering.responseId) {
+        return { completed: false, status: rendering.reason }
+      }
+      releaseVerbatimAudio(rendering.responseId)
+      return { completed: true, responseId: rendering.responseId }
     }
 
     const finishResponseContextIfComplete = (id, context) => {
@@ -902,12 +1122,18 @@ export function attachRealtimeGateway(server, {
       if (context?.suppressed) return
       announcementWindow.startPlayback(id)
       const playbackTurnId = context?.turnId || playbackTurns.get(id) || turnId
-      send(ws, {
-        type: 'voice.state',
-        state: 'speaking',
-        turnId: playbackTurnId,
-        origin: context?.origin || 'model',
-      })
+      // A verified final answer emitted its own speaking state before the
+      // audio, so that `audio.done` can stay the turn's last frame. The
+      // client's playback receipt must not append another state frame after
+      // it (ESS-1165).
+      if (!context?.ownsPlaybackState) {
+        send(ws, {
+          type: 'voice.state',
+          state: 'speaking',
+          turnId: playbackTurnId,
+          origin: context?.origin || 'model',
+        })
+      }
       if (!context || context.playbackStarted) return
       context.playbackStarted = true
       if (confirmsTaskNotificationOnPlaybackStart(context)) {
@@ -1039,12 +1265,14 @@ export function attachRealtimeGateway(server, {
           scheduleResponseContextCleanup(id, context)
         }
       }
-      send(ws, {
-        type: 'voice.state',
-        state: userSpeaking ? 'listening' : 'idle',
-        turnId: userSpeaking ? turnId : playbackTurnId,
-        origin: context?.origin || 'model',
-      })
+      if (!context?.ownsPlaybackState) {
+        send(ws, {
+          type: 'voice.state',
+          state: userSpeaking ? 'listening' : 'idle',
+          turnId: userSpeaking ? turnId : playbackTurnId,
+          origin: context?.origin || 'model',
+        })
+      }
       const timer = setTimeout(
         () => announcements.flush(),
         config.announcementQuietMs,
@@ -1066,6 +1294,59 @@ export function attachRealtimeGateway(server, {
         recordResult(task)
         queueNotification(task)
       })
+    }
+
+    /**
+     * Deterministic delivery of a task's authoritative final answer.
+     *
+     * The authoritative text has already gone out on the task stream when this
+     * runs. What remains is its rendering, and the rendering is only accepted
+     * when the model read that exact text back (ESS-1165). The frame order is
+     * fixed here on purpose: lifecycle terminal, then `task.stream.done`, then
+     * the notification settlement, and only then the held audio — so the
+     * verified answer's single `audio.done` is the last frame of the turn.
+     *
+     * Speech that cannot be rendered faithfully is withheld rather than
+     * replaced: the result is already delivered as text, and handing it back
+     * to the announcement surface would let the model author the answer again,
+     * which is exactly the defect this path removes.
+     */
+    const deliverFinalAnswer = async (identity, text, task) => {
+      const rendering = await renderVerbatimSpeech(text, {
+        turnId: identity.turnId,
+        taskId: identity.taskId,
+        taskIds: [identity.taskId],
+      })
+      const spoke = Boolean(rendering.responseId)
+      const fallbackReason = spoke ? null : rendering.reason
+      taskStreamProtocol.responseDone(identity, {
+        finalAudioSequence: spoke ? 0 : -1,
+        ...(fallbackReason ? { streamingFallbackReason: fallbackReason } : {}),
+      })
+      send(ws, {
+        type: 'task.stream.done',
+        taskId: identity.taskId,
+        turnId: identity.turnId,
+        final_sequence: spoke ? 0 : -1,
+        ...(fallbackReason ? { streaming_fallback_reason: fallbackReason } : {}),
+      })
+      if (fallbackReason) {
+        connectionLogger.warn('task.final_answer_speech_withheld', {
+          taskId: identity.taskId,
+          turnId: identity.turnId,
+          generation: identity.generation,
+          reason: fallbackReason,
+        })
+        send(ws, {
+          type: 'task.stream.fallback',
+          taskId: identity.taskId,
+          streaming_fallback_reason: fallbackReason,
+        })
+      }
+      const voiceUnavailable = fallbackReason === 'voice_output_unavailable'
+      terminalDelivery.settle(identity, { delivered: !voiceUnavailable })
+      if (voiceUnavailable) claimPendingNotifications([task.id])
+      if (spoke) releaseVerbatimAudio(rendering.responseId)
     }
 
     const unsubscribeTasks = taskManager.subscribe(event => {
@@ -1251,7 +1532,7 @@ export function attachRealtimeGateway(server, {
         // generation), never on the answer text: two runs may legitimately
         // produce the same words, while one run must never be replayed.
         if (!terminalDelivery.begin(terminalIdentity)) return
-        let wasStreamed = streamedTaskIds.has(task.id)
+        const wasStreamed = streamedTaskIds.has(task.id)
         // Some ACP backends only publish a final task result and never emit
         // task.stream.chunk. Treat that final result as the last content
         // increment instead of completing the protocol before the result
@@ -1260,19 +1541,31 @@ export function attachRealtimeGateway(server, {
         const finalSpeech = event.type === 'task.completed'
           ? String(task.resultMetadata?.presentation?.speech || task.result || '').trim()
           : ''
-        if (!wasStreamed && finalSpeech) {
-          taskStreamProtocol.text(terminalIdentity, finalSpeech)
-          if (outputEnabled && frontend?.ready) {
-            codexStreamProjector.push(terminalIdentity, finalSpeech)
-            wasStreamed = true
-          }
-        }
+        // The authoritative final text goes out verbatim and exactly once,
+        // before anything is spoken. It is the deterministic half of the
+        // delivery: it does not depend on any model behaviour.
+        const deliversFinalAnswer = !wasStreamed && Boolean(finalSpeech)
+        if (deliversFinalAnswer) taskStreamProtocol.text(terminalIdentity, finalSpeech)
         taskStreamProtocol.taskDone(
           terminalIdentity,
           event.type === 'task.completed' ? 'completed' : 'failed',
           event.type === 'task.failed' ? { error: task.error || null } : {},
         )
-        if (!wasStreamed) taskStreamProtocol.responseDone(terminalIdentity)
+        if (deliversFinalAnswer) {
+          // Same-tick claim, for the reason spelled out in the streamed branch
+          // below: `task.notification.pending` is emitted in this very tick.
+          terminalDelivery.claimStream(terminalIdentity)
+          deliverFinalAnswer(terminalIdentity, finalSpeech, task).catch(error => {
+            connectionLogger.error('task.final_answer_delivery_failed', {
+              taskId: task.id,
+              turnId: task.turnId || null,
+              error: error?.message || String(error),
+            })
+            terminalDelivery.settle(terminalIdentity, { delivered: false })
+          })
+        } else if (!wasStreamed) {
+          taskStreamProtocol.responseDone(terminalIdentity)
+        }
         if (wasStreamed) {
           // The streamed speech IS the notification delivery, so claim it now,
           // synchronously. TaskManager emits `task.notification.pending` in
@@ -1308,7 +1601,9 @@ export function attachRealtimeGateway(server, {
             },
           })
         }
-        if (!wasStreamed) claimPendingNotifications([task.id])
+        if (!wasStreamed && !deliversFinalAnswer) {
+          claimPendingNotifications([task.id])
+        }
       }
     })
 
@@ -1502,6 +1797,18 @@ export function attachRealtimeGateway(server, {
         )
         if (responseContext?.suppressed) return
         const responseTurnId = responseContext.turnId || turnId
+        // A response that renders a task's authoritative final answer is held
+        // until its transcript is verified against that answer (ESS-1165), so
+        // a rewritten or replaced utterance never reaches the ear at all.
+        if (responseContext.verbatimSpeech && !responseContext.verbatimReleased) {
+          responseContext.heldAudio ||= []
+          responseContext.heldAudio.push({
+            audio: event.delta,
+            sampleRate: Number(event.sampleRate)
+              || frontend.provider.outputSampleRate,
+          })
+          return
+        }
         if (id) {
           if (
             !responseContext.hasAudio
@@ -1630,6 +1937,20 @@ export function attachRealtimeGateway(server, {
         const responseFailed = ['failed', 'cancelled', 'incomplete'].includes(
           responseStatus,
         )
+        // A rendering of a task's authoritative final answer settles on its
+        // own path: its audio is still held, so none of the framing below
+        // applies until the delivery has verified it and written the
+        // lifecycle terminal (ESS-1165).
+        if (isHeldVerbatim(responseContext)) {
+          settleVerbatimRendering({
+            id,
+            context: responseContext,
+            responseFailed,
+            responseStatus,
+            responseTurnId,
+          })
+          return
+        }
         // Each disjunct is logged separately: the combined boolean is what made
         // ESS-977 mis-attributable, because "suppressed" could not be traced
         // back to which of the four conditions actually fired.
@@ -2626,6 +2947,8 @@ export function attachRealtimeGateway(server, {
       // In-flight streamed answers die with the socket; hand their claims back
       // so another delivery surface can still deliver them exactly once.
       terminalDelivery.close()
+      // Held audio and its pending verdicts belong to a socket that is gone.
+      verbatimVerdicts.clear()
       clearResponseCandidate()
       turnGeneration = ++turnSequence
       committedTurnGeneration = turnGeneration

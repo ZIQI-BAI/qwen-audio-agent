@@ -378,17 +378,29 @@ function assistantTranscriptsFor(frames, taskId) {
     .map(frame => frame.content)
 }
 
-test('a streamed weather answer is spoken exactly once (ESS-1147 2x repeat)', async () => {
+test('a weather answer is spoken exactly once (ESS-1147 2x repeat)', async () => {
   const { taskId, frames } = await runDelegatedTurn({
     answerText: WEATHER_ANSWER,
     sessionId: 'ess1156-weather',
   })
 
-  const segments = frames.filter(frame => (
-    frame.type === 'task.stream.segment' && frame.taskId === taskId
+  // ESS-1165 stopped projecting a task's authoritative final answer into
+  // segments: every segment was a separate prompt, and a real model answered
+  // one of them with a restated whole answer. The final answer is now one
+  // verified utterance.
+  assert.equal(
+    frames.filter(frame => (
+      frame.type === 'task.stream.segment' && frame.taskId === taskId
+    )).length,
+    0,
+    'the final answer is delivered as one utterance, not projected segments',
+  )
+  const answerText = frames.filter(frame => (
+    frame.type === 'task.stream' && frame.category === 'text'
+    && frame.taskId === taskId
   ))
-  assert.equal(segments.length, 2, 'the captured weather answer projects into 2 segments')
-  assert.equal(segments.map(item => item.text).join(''), WEATHER_ANSWER)
+  assert.equal(answerText.length, 1, 'exactly one final answer text frame')
+  assert.equal(answerText[0].delta, WEATHER_ANSWER)
 
   const spoken = assistantTranscriptsFor(frames, taskId)
   assert.equal(
@@ -398,17 +410,25 @@ test('a streamed weather answer is spoken exactly once (ESS-1147 2x repeat)', as
   )
 })
 
-test('a streamed knowledge answer is spoken exactly once (ESS-1147 4x repeat)', async () => {
+test('a knowledge answer is spoken exactly once (ESS-1147 4x repeat)', async () => {
   const { taskId, frames } = await runDelegatedTurn({
     answerText: KNOWLEDGE_ANSWER,
     sessionId: 'ess1156-knowledge',
   })
 
-  const segments = frames.filter(frame => (
-    frame.type === 'task.stream.segment' && frame.taskId === taskId
+  assert.equal(
+    frames.filter(frame => (
+      frame.type === 'task.stream.segment' && frame.taskId === taskId
+    )).length,
+    0,
+    'the final answer is delivered as one utterance, not projected segments',
+  )
+  const answerText = frames.filter(frame => (
+    frame.type === 'task.stream' && frame.category === 'text'
+    && frame.taskId === taskId
   ))
-  assert.equal(segments.length, 4, 'the captured knowledge answer projects into 4 segments')
-  assert.equal(segments.map(item => item.text).join(''), KNOWLEDGE_ANSWER)
+  assert.equal(answerText.length, 1, 'exactly one final answer text frame')
+  assert.equal(answerText[0].delta, KNOWLEDGE_ANSWER)
 
   const spoken = assistantTranscriptsFor(frames, taskId)
   assert.equal(

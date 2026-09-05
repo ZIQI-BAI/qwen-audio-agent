@@ -8,6 +8,7 @@ import {
   frontendTools,
   resultResponseInstructions,
   speakResponseInstructions,
+  verbatimSpeechInstructions,
   permissionResponseInstructions,
 } from '../frontend-tools.mjs'
 import { isRecoverableRealtimeInactivityError } from '../realtime-errors.mjs'
@@ -96,6 +97,16 @@ export const dashscopeProvider = {
     conversation: 'none',
     modalities: responseModalities(activeModelProfile()),
     instructions: speakResponseInstructions(content),
+  }),
+
+  // Rendering request for a task's authoritative final answer. Text output is
+  // requested even when the profile would speak only: the transcript is what
+  // the gateway verifies the audio against before releasing it.
+  buildVerbatimSpeechResponse: content => ({
+    conversation: 'none',
+    modalities: responseModalities(activeModelProfile()),
+    tool_choice: 'none',
+    instructions: verbatimSpeechInstructions(content),
   }),
 
   buildResultInjection: content => ({

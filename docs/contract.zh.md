@@ -60,6 +60,14 @@ Codex 委托语音流先发布有序的 `task.stream.segment`，仅在 ACP 终�
 全部 drain 后发布 `task.stream.done`。`task.stream.fallback` 携带完整结果
 回退原因，`task.stream.aborted` 收口取消流，`task.stream.first_audio` 上报
 首段开始到首个音频帧的延迟；服务端日志同时维护最近 100 个样本的 P95。
+
+任务的权威最终答案不走分段流：它作为一帧 `task.stream` `text` 原样发布
+`resultMetadata.presentation.speech`，并只朗读一次；该次朗读的音频先由
+Gateway 暂存，直到提供方自己的 transcript 与该文本一致才放行。被模型改写、
+扩写、截断或替换的朗读在任何音频下发之前丢弃，重试一次，仍不一致则不播报，
+并以 `task.stream.fallback` 上报 `speech_rewritten` / `speech_expanded` /
+`speech_truncated` / `speech_missing`。生命周期终态与 `task.stream.done`
+位于唯一 `audio.done` 之前，`audio.done` 是该 turn 的最后一帧。
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`、`listSkins`、`removeSkin`、`effectiveOrbSkin`、`skinsDirectory`、`validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`、`configureOrbWindow`、`ORB_CHANNELS` |
