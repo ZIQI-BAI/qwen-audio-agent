@@ -23,11 +23,16 @@
 // model still sees the whole conversation and answers the user's question from
 // it — including "抱歉，我没法直接访问您个人的 Obsidian 知识库".
 //
-// The fix has two halves, and this file covers both:
+// The fix has three parts, and this file covers all of them:
 //   1. the answer is read, not re-authored: one utterance, empty input,
 //      reader instructions;
-//   2. the reading is verified against the text it was handed, so a divergence
-//      is a frame anyone can check rather than something only a listener hears.
+//   2. the reading is held back until it has been checked against the text it
+//      was handed, so a rewritten utterance is dropped before the client sees
+//      a single audio frame — verifying afterwards would only label a delivery
+//      that already happened, which is what the ESS-1165 review rejected;
+//   3. recovery is deterministic: the discarded attempt is retried, then
+//      synthesized, then delivered as text. No path narrates the answer in the
+//      model's own words.
 
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
@@ -59,6 +64,57 @@ const {
   VERBATIM_SPEECH_CLOSE_TAG,
   VERBATIM_SPEECH_OPEN_TAG,
 } = await import('../src/voice/frontend-tools.mjs')
+const { config } = await import('../src/core/config.mjs')
+
+/**
+ * Minimal stand-in for the DashScope TTS endpoint: it answers with a real
+ * mono/16-bit/24 kHz WAV, so the gateway exercises its actual HTTP + container
+ * decoding path rather than a stubbed buffer.
+ */
+function wavOf(samples) {
+  const pcm = Buffer.alloc(samples * 2)
+  for (let index = 0; index < samples; index += 1) {
+    pcm.writeInt16LE(Math.round(Math.sin(index / 8) * 8000), index * 2)
+  }
+  const header = Buffer.alloc(44)
+  header.write('RIFF', 0, 'ascii')
+  header.writeUInt32LE(36 + pcm.length, 4)
+  header.write('WAVE', 8, 'ascii')
+  header.write('fmt ', 12, 'ascii')
+  header.writeUInt32LE(16, 16)
+  header.writeUInt16LE(1, 20)
+  header.writeUInt16LE(1, 22)
+  header.writeUInt32LE(24000, 24)
+  header.writeUInt32LE(24000 * 2, 28)
+  header.writeUInt16LE(2, 32)
+  header.writeUInt16LE(16, 34)
+  header.write('data', 36, 'ascii')
+  header.writeUInt32LE(pcm.length, 40)
+  return Buffer.concat([header, pcm])
+}
+
+function startTtsStub() {
+  const requests = []
+  const server = createServer((req, res) => {
+    let body = ''
+    req.on('data', chunk => { body += chunk })
+    req.on('end', () => {
+      const payload = JSON.parse(body || '{}')
+      requests.push(payload.input?.text || '')
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        output: { audio: { data: wavOf(4800).toString('base64') } },
+      }))
+    })
+  })
+  return new Promise(resolve => {
+    server.listen(0, '127.0.0.1', () => resolve({
+      requests,
+      url: `http://127.0.0.1:${server.address().port}/tts`,
+      close: () => new Promise(done => server.close(done)),
+    }))
+  })
+}
 
 // Verbatim from the `task.completed` frames of the ESS-1157 JSONL captures.
 const WEATHER_ANSWER = '杭州现在大约二十五摄氏度，晴到多云，湿度约百分之八十，'
@@ -97,12 +153,13 @@ function verbatimContent(instructions) {
  * the reader instructions and has its conversation input removed is read back
  * verbatim, as the real model does.
  */
-function startRealtimeUpstream({ rewrite, alwaysRewrite = false }) {
+function startRealtimeUpstream({ rewrite, rewriteAttempts = 0 }) {
   const server = createServer()
   const wss = new WebSocketServer({ server })
   const responses = []
   wss.on('connection', ws => {
     let sequence = 0
+    let verbatimRequests = 0
     ws.send(JSON.stringify({ type: 'session.created', session: { id: 'sess' } }))
     ws.on('message', raw => {
       let event
@@ -127,7 +184,13 @@ function startRealtimeUpstream({ rewrite, alwaysRewrite = false }) {
       const response = event.response || {}
       const asked = verbatimContent(response.instructions)
       const isolated = Array.isArray(response.input) && response.input.length === 0
-      const spoken = asked && isolated && !alwaysRewrite ? asked : rewrite
+      // `rewriteAttempts` reproduces a model that refuses to read for the first
+      // N requests: Infinity is the ESS-1157 knowledge case, 1 is a model that
+      // complies on the retry.
+      const refuses = asked && isolated
+        ? ++verbatimRequests <= rewriteAttempts
+        : true
+      const spoken = refuses ? rewrite : asked
       responses.push({ id, response, asked, isolated, spoken })
       ws.send(JSON.stringify({ type: 'response.created', response: { id } }))
       setTimeout(() => {
@@ -310,8 +373,10 @@ function waitFor(frames, predicate, timeoutMs = 8000) {
   })
 }
 
-async function runDelegatedTurn({ answerText, rewrite, sessionId, alwaysRewrite }) {
-  const upstream = await startRealtimeUpstream({ rewrite, alwaysRewrite })
+async function runDelegatedTurn({
+  answerText, rewrite, sessionId, rewriteAttempts = 0, terminalFrameType = 'task.stream.done',
+}) {
+  const upstream = await startRealtimeUpstream({ rewrite, rewriteAttempts })
   const server = await startGateway(upstream.url)
   const { socket, frames } = await connectClient(server, sessionId)
   await waitFor(frames, frame => frame.type === 'voice.ready')
@@ -330,7 +395,7 @@ async function runDelegatedTurn({ answerText, rewrite, sessionId, alwaysRewrite 
 
   const done = await waitFor(
     frames,
-    frame => frame.type === 'task.stream.done' && frame.taskId === created.id,
+    frame => frame.type === terminalFrameType && frame.taskId === created.id,
   )
   // Nothing may follow the terminal frame, so give a late duplicate a window.
   await new Promise(resolve => setTimeout(resolve, 500))
@@ -410,26 +475,156 @@ test('the knowledge answer the real model dropped entirely is now read verbatim'
   assert.equal(done.verbatim, true)
 })
 
-test('a model that rewrites anyway is reported, not silently accepted', async () => {
-  const { taskId, frames, done } = await runDelegatedTurn({
+test('a rewritten utterance never reaches the client, and the retry does', async () => {
+  const { taskId, frames, done, upstream } = await runDelegatedTurn({
     answerText: WEATHER_ANSWER,
     rewrite: WEATHER_REWRITE,
-    sessionId: 'ess1165-unfaithful',
-    alwaysRewrite: true,
+    sessionId: 'ess1165-retry',
+    // The model rewrites once, then complies — the ESS-1157 weather shape.
+    rewriteAttempts: 1,
   })
 
-  const spoken = assistantTranscriptsFor(frames, taskId)
-  assert.deepEqual(spoken, [WEATHER_REWRITE], 'the capture is what the model said')
   assert.equal(
-    done.verbatim, false,
-    'the delivery is reported unfaithful, so a run can be judged from frames',
+    upstream.responses.filter(item => item.asked).length, 2,
+    'the discarded reading was re-requested',
   )
-  const terminal = frames.find(frame => (
+  const spoken = assistantTranscriptsFor(frames, taskId)
+  assert.deepEqual(
+    spoken, [WEATHER_ANSWER],
+    'the answer is heard once; the rewrite is not heard at all',
+  )
+  assert.ok(
+    !frames.some(frame => (
+      frame.type === 'transcript.final' && frame.content === WEATHER_REWRITE
+    )),
+    'the rewritten transcript never left the gateway',
+  )
+  // Every audio frame the client saw belongs to the accepted reading.
+  const audioResponseIds = new Set(
+    frames.filter(frame => frame.type === 'audio.delta').map(frame => frame.responseId),
+  )
+  assert.equal(audioResponseIds.size, 1, 'only one utterance produced audio')
+  assert.equal(done.verbatim, true)
+  assert.equal(done.delivery, 'verbatim')
+})
+
+test('an answer the model will not read is synthesized, not narrated', async () => {
+  const tts = await startTtsStub()
+  const previous = config.deterministicTtsBaseUrl
+  config.deterministicTtsBaseUrl = tts.url
+  try {
+    const { taskId, frames, done } = await runDelegatedTurn({
+      answerText: WEATHER_ANSWER,
+      rewrite: WEATHER_REWRITE,
+      sessionId: 'ess1165-synth',
+      // Never complies — the ESS-1157 knowledge case.
+      rewriteAttempts: Number.POSITIVE_INFINITY,
+    })
+
+    assert.deepEqual(tts.requests, [WEATHER_ANSWER], 'the exact answer was synthesized')
+    const spoken = assistantTranscriptsFor(frames, taskId)
+    assert.deepEqual(
+      spoken, [WEATHER_ANSWER],
+      'the listener gets the answer, and gets it once',
+    )
+    assert.ok(
+      !frames.some(frame => (
+        frame.type === 'transcript.final' && frame.content === WEATHER_REWRITE
+      )),
+      'no attempt at rewriting was ever delivered',
+    )
+    const audio = frames.filter(frame => frame.type === 'audio.delta')
+    assert.ok(audio.length > 0, 'synthesized audio reached the client')
+    assert.equal(
+      new Set(audio.map(frame => frame.responseId)).size, 1,
+      'exactly one utterance carried audio',
+    )
+    assert.equal(audio[0].sampleRate, 24000)
+    assert.equal(done.delivery, 'synthesized')
+    assert.equal(done.verbatim, true, 'the delivered content is the answer')
+  } finally {
+    config.deterministicTtsBaseUrl = previous
+    await tts.close()
+  }
+})
+
+test('with no synthesis the answer degrades to text, never to a rewrite', async () => {
+  const previous = config.deterministicTtsModel
+  config.deterministicTtsModel = ''
+  try {
+    const { taskId, frames } = await runDelegatedTurn({
+      answerText: KNOWLEDGE_ANSWER,
+      rewrite: KNOWLEDGE_REWRITE,
+      sessionId: 'ess1165-textonly',
+      rewriteAttempts: Number.POSITIVE_INFINITY,
+      terminalFrameType: 'task.stream.fallback',
+    })
+
+    const spoken = assistantTranscriptsFor(frames, taskId)
+    assert.deepEqual(
+      spoken, [KNOWLEDGE_ANSWER],
+      'the authoritative answer is still delivered, as text',
+    )
+    assert.ok(
+      !frames.some(frame => (
+        frame.type === 'transcript.final' && frame.content === KNOWLEDGE_REWRITE
+      )),
+      'the progress boilerplate the model produced was never delivered',
+    )
+    assert.equal(
+      frames.filter(frame => frame.type === 'audio.delta').length, 0,
+      'nothing was played, because nothing could be played faithfully',
+    )
+    const fallback = frames.find(frame => frame.type === 'task.stream.fallback')
+    assert.equal(fallback.streaming_fallback_reason, 'speech_not_verbatim')
+  } finally {
+    config.deterministicTtsModel = previous
+  }
+})
+
+test('the lifecycle terminal precedes the answer\'s audio.done', async () => {
+  const { taskId, frames } = await runDelegatedTurn({
+    answerText: WEATHER_ANSWER,
+    rewrite: WEATHER_REWRITE,
+    sessionId: 'ess1165-order',
+  })
+
+  const answerResponseId = frames.find(frame => (
+    frame.type === 'transcript.final'
+    && frame.role === 'assistant'
+    && frame.taskId === taskId
+  )).responseId
+  const terminal = frames.findIndex(frame => (
     frame.type === 'task.stream'
     && frame.category === 'terminal'
     && frame.taskId === taskId
   ))
-  assert.equal(terminal.verbatim, false, 'the lifecycle terminal carries the verdict')
+  const streamDone = frames.findIndex(frame => (
+    frame.type === 'task.stream.done' && frame.taskId === taskId
+  ))
+  const audioDones = frames
+    .map((frame, index) => ({ frame, index }))
+    .filter(item => (
+      item.frame.type === 'audio.done'
+      && item.frame.responseId === answerResponseId
+    ))
+
+  assert.equal(audioDones.length, 1, 'the answer has exactly one audio.done')
+  assert.ok(terminal >= 0 && streamDone >= 0)
+  assert.ok(
+    terminal < streamDone && streamDone < audioDones[0].index,
+    'terminal -> task.stream.done -> the answer\'s audio.done, in that order',
+  )
+  // The barrier ESS-1110 asks for still holds: the terminal is written only
+  // after the answer exists and has been verified, so it can never announce a
+  // delivery that has not been produced.
+  const firstAnswerAudio = frames.findIndex(frame => (
+    frame.type === 'audio.delta' && frame.responseId === answerResponseId
+  ))
+  assert.ok(
+    firstAnswerAudio > terminal,
+    'the answer audio is released after the terminal, not before it',
+  )
 })
 
 test('fidelity ignores what a listener cannot hear', () => {

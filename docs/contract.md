@@ -69,6 +69,32 @@ followed by `task.stream.done` only after ACP termination and speech drain.
 `task.stream.aborted` closes cancelled streams, and `task.stream.first_audio`
 reports the first segment's start-to-first-frame latency plus the server log's
 bounded 100-sample P95 window.
+
+### Delivering a task's final answer
+
+A delegated task's answer is authoritative content, so the realtime model reads
+it rather than re-authoring it, and the reading is checked before anyone hears
+it. A result that arrives complete is one utterance, so a whole answer has one
+final transcript, one TTS and one `audio.done`.
+
+Every utterance is held at the Gateway until its transcript has been compared
+with the text it was asked to read. A rewritten one is dropped whole — the
+client never receives a frame of it — and the delivery falls through a fixed
+order: retry the reading (`QWEN_AUDIO_AGENT_TERMINAL_SPEECH_RETRIES`, default
+1), then deterministic text-to-speech (`QWEN_AUDIO_AGENT_TTS_MODEL`, empty
+disables it), then the answer as text with
+`streaming_fallback_reason: speech_not_verbatim`. No step narrates the answer in
+the model's own words. `task.stream.done` and the lifecycle terminal carry
+`delivery` (`verbatim` / `synthesized` / `null`) and `verbatim`, so a run is
+judged from its frames rather than by ear.
+
+Ordering follows from the hold: the lifecycle terminal is written once the
+answer has been produced **and** verified, and the held audio is released after
+it. So the terminal precedes the answer's unique `audio.done`, and
+`task.stream.done` is the last frame of the task stream. This is strictly
+stronger than the older "terminal waits for the response/audio drain" barrier —
+the terminal can no longer describe a delivery that was not produced, and it can
+no longer arrive after the listener already heard the answer.
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`, `listSkins`, `removeSkin`, `effectiveOrbSkin`, `skinsDirectory`, `validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`, `configureOrbWindow`, `ORB_CHANNELS` |

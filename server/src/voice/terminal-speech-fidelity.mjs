@@ -48,8 +48,12 @@ export function isVerbatimSpeech(expected, spoken) {
 }
 
 /**
- * Per-connection ledger of terminal speech fidelity, keyed by the same delivery
- * identity the terminal frame carries.
+ * Per-connection ledger of how a task answer was delivered, keyed by the same
+ * delivery identity the terminal frame carries.
+ *
+ * Only utterances that actually reached the client are recorded. Attempts the
+ * gate discarded never happened downstream, so they appear here as divergences
+ * — evidence for the log — but never as a delivery.
  */
 export class TerminalSpeechFidelity {
   constructor({ maxEntries = 64 } = {}) {
@@ -63,20 +67,50 @@ export class TerminalSpeechFidelity {
     }`
   }
 
-  /** Record one spoken segment against the text it was asked to read. */
-  record(identity, { expected, spoken }) {
+  entry(identity) {
     const key = TerminalSpeechFidelity.key(identity)
-    const entry = this.entries.get(key)
-      || { verbatim: true, segments: 0, divergences: [] }
-    entry.segments += 1
-    if (!isVerbatimSpeech(expected, spoken)) {
-      entry.verbatim = false
-      entry.divergences.push({ expected, spoken })
+    const existing = this.entries.get(key)
+    if (existing) return existing
+    const created = {
+      segments: 0, divergences: [], delivered: null, delivery: null,
     }
-    this.entries.set(key, entry)
+    this.entries.set(key, created)
     while (this.entries.size > this.maxEntries) {
       this.entries.delete(this.entries.keys().next().value)
     }
+    return created
+  }
+
+  /**
+   * Record one delivered segment. `spoken` equal to `expected` marks a verbatim
+   * delivery; anything else is a divergence that was dropped before playback.
+   */
+  record(identity, { expected, spoken }) {
+    const entry = this.entry(identity)
+    if (isVerbatimSpeech(expected, spoken)) {
+      entry.segments += 1
+      entry.delivered = entry.delivered !== false
+      entry.delivery ||= 'verbatim'
+      return entry
+    }
+    entry.divergences.push({ expected, spoken })
+    return entry
+  }
+
+  /** Record a segment delivered by deterministic synthesis instead. */
+  recordSynthesized(identity) {
+    const entry = this.entry(identity)
+    entry.segments += 1
+    entry.delivered = entry.delivered !== false
+    entry.delivery = 'synthesized'
+    return entry
+  }
+
+  /** Record that no faithful delivery was possible for this identity. */
+  recordUndelivered(identity) {
+    const entry = this.entry(identity)
+    entry.delivered = false
+    entry.delivery = null
     return entry
   }
 

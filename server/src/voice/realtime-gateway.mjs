@@ -35,6 +35,8 @@ import {
   responseActivityContextPatch,
 } from './response-context.mjs'
 import { TerminalSpeechFidelity } from './terminal-speech-fidelity.mjs'
+import { TerminalSpeechGate } from './terminal-speech-gate.mjs'
+import { DeterministicSpeech, pcmFrames } from './deterministic-speech.mjs'
 import {
   ActiveVoiceClients,
   clientVoiceCapabilities,
@@ -404,23 +406,220 @@ export function attachRealtimeGateway(server, {
       ),
       log: connectionLogger,
     })
-    // A task answer is authoritative content, so it is read out, not
-    // re-authored, and every utterance is checked against the text it was asked
-    // to read (ESS-1165).
+    // A task answer is authoritative content, so it is read out rather than
+    // re-authored, and it is held back until the reading has been checked
+    // against the text it was asked to read (ESS-1165).
     const terminalSpeechFidelity = new TerminalSpeechFidelity()
-    const codexStreamProjector = new CodexStreamProjector({
-      speak: (text, context) => frontend.speakVerbatim(text, 'agent', {
-        turnId: context.turnId,
+    const terminalSpeechGate = new TerminalSpeechGate({
+      send: frame => send(ws, frame),
+      log: connectionLogger,
+    })
+    const deterministicSpeech = new DeterministicSpeech({
+      sampleRate: null,
+      log: connectionLogger,
+    })
+    // Utterances verified but deliberately still held, so the lifecycle
+    // terminal can be written before the answer's audio.done. Keyed by task
+    // stream identity, because that is what onDone knows.
+    const heldFinalUtterances = new Map()
+    const releaseHeldUtterance = identity => {
+      const key = TerminalSpeechFidelity.key(identity)
+      const responseId = heldFinalUtterances.get(key)
+      if (!responseId) return false
+      heldFinalUtterances.delete(key)
+      terminalSpeechGate.release(responseId)
+      return true
+    }
+
+    /**
+     * Speak one task-answer segment and only let it through once it is known
+     * to be the answer.
+     *
+     * Every attempt is gated, so a rewritten utterance is dropped before the
+     * client sees a single audio frame; retrying therefore cannot make the
+     * listener hear the answer twice. When the model will not read it at all,
+     * the answer is synthesized deterministically instead of being generated
+     * again.
+     */
+    const speakTaskAnswer = async (text, context) => {
+      const identity = {
+        sessionId: context.sessionId,
         taskId: context.taskId,
-        streamSequence: context.sequence,
-        streamSegmentStartedAt: Date.now(),
-        verbatimSpeech: {
-          text,
-          sessionId: context.sessionId,
+        generation: context.generation,
+      }
+      const attempts = Math.max(0, config.terminalSpeechRetries) + 1
+      let lastOutcome = null
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const outcome = await frontend.speakVerbatim(text, 'agent', {
+          turnId: context.turnId,
           taskId: context.taskId,
-          generation: context.generation,
-        },
-      }),
+          streamSequence: context.sequence,
+          streamSegmentStartedAt: Date.now(),
+          verbatimSpeech: { ...identity, text, attempt },
+        })
+        lastOutcome = outcome
+        const responseId = outcome?.responseId
+        if (!outcome?.completed) {
+          // A transport failure is not a fidelity failure: drop whatever was
+          // buffered and let the projector take its existing fallback path.
+          terminalSpeechGate.discard(responseId, 'response_not_completed')
+          return outcome
+        }
+        if (terminalSpeechGate.verdict(responseId) !== false) {
+          terminalSpeechFidelity.record(identity, {
+            expected: text,
+            spoken: text,
+          })
+          // `context` is the projector's own stream identity; `identity` is the
+          // delivery identity the terminal frame carries, and the two key
+          // differently.
+          if (codexStreamProjector.isFinalSegment(context)) {
+            // Held until onDone has written the lifecycle terminal, so the
+            // answer's audio.done follows the terminal instead of preceding it.
+            heldFinalUtterances.set(
+              TerminalSpeechFidelity.key(identity), responseId,
+            )
+          } else {
+            terminalSpeechGate.release(responseId)
+          }
+          return outcome
+        }
+        const divergence = terminalSpeechGate.divergence(responseId)
+        terminalSpeechFidelity.record(identity, {
+          expected: text,
+          spoken: divergence?.spoken || '',
+        })
+        connectionLogger.warn('task.stream.speech_retry', {
+          ...identity,
+          responseId,
+          attempt,
+          remaining: attempts - attempt - 1,
+        })
+        // Nothing reached the ear, so this attempt never happened downstream.
+        terminalSpeechGate.discard(responseId)
+      }
+      const synthesized = await deliverSynthesizedAnswer(text, {
+        ...identity,
+        turnId: context.turnId,
+      })
+      if (synthesized) return { ...lastOutcome, completed: true }
+      // Nothing can speak this answer faithfully. It is still delivered — as
+      // the authoritative text — rather than handed to a surface that would
+      // narrate it in the model's own words.
+      deliverAnswerAsText(text, { ...identity, turnId: context.turnId })
+      return {
+        completed: false,
+        status: 'speech_not_verbatim',
+        responseId: lastOutcome?.responseId || null,
+      }
+    }
+
+    /**
+     * Deliver the answer as text when no path can speak it as written.
+     *
+     * The text is the task result verbatim, so this is still a faithful
+     * delivery — just a silent one. It exists so a failed reading never falls
+     * back to a surface that rewrites the answer.
+     */
+    const deliverAnswerAsText = (text, identity) => {
+      const responseId = `text_${randomUUID().replaceAll('-', '')}`
+      const context = mergeResponseContext(responseContexts, responseId, {
+        turnId: identity.turnId || turnId,
+        taskId: identity.taskId,
+        taskIds: [identity.taskId],
+        origin: 'agent',
+        turnGeneration: committedTurnId ? committedTurnGeneration : turnGeneration,
+      })
+      context.transcriptDone = true
+      context.responseDone = true
+      context.assistantTranscript = text
+      emitAssistantTranscript({ id: responseId, context, content: text, final: true })
+      connectionLogger.warn('task.stream.speech_text_only', {
+        ...identity,
+        responseId,
+      })
+      terminalSpeechFidelity.recordUndelivered(identity)
+      return true
+    }
+
+    /**
+     * Deliver the answer with deterministic synthesis.
+     *
+     * The realtime attempts that got here were all discarded unheard, so this
+     * is the first audio the listener receives for the answer. The audio is a
+     * function of the text alone, so the transcript needs no verification.
+     */
+    const deliverSynthesizedAnswer = async (text, identity) => {
+      if (!deterministicSpeech.available) {
+        connectionLogger.warn('task.stream.synthesis_unavailable', identity)
+        terminalSpeechFidelity.recordUndelivered(identity)
+        return false
+      }
+      let audio
+      try {
+        audio = await deterministicSpeech.synthesize(text)
+      } catch (error) {
+        connectionLogger.warn('task.stream.synthesis_failed', {
+          ...identity,
+          error: error.message,
+        })
+        terminalSpeechFidelity.recordUndelivered(identity)
+        return false
+      }
+      const responseId = `synth_${randomUUID().replaceAll('-', '')}`
+      const context = mergeResponseContext(responseContexts, responseId, {
+        turnId: identity.turnId || turnId,
+        taskId: identity.taskId,
+        taskIds: [identity.taskId],
+        origin: 'agent',
+        turnGeneration: committedTurnId ? committedTurnGeneration : turnGeneration,
+      })
+      context.hasAudio = true
+      playbackTurns.set(responseId, context.turnId)
+      send(ws, {
+        type: 'response.started',
+        responseId,
+        ...publicResponseContext(context),
+      })
+      announcementWindow.queueAudio(responseId, {
+        turnId: context.turnId,
+        origin: 'agent',
+      })
+      for (const frame of pcmFrames(audio.pcm)) {
+        send(ws, {
+          type: 'audio.delta',
+          audio: frame,
+          sampleRate: audio.sampleRate,
+          responseId,
+          turnId: context.turnId,
+        })
+      }
+      // The synthesized transcript is the answer by construction.
+      context.transcriptDone = true
+      context.assistantTranscript = text
+      emitAssistantTranscript({ id: responseId, context, content: text, final: true })
+      context.responseDone = true
+      connectionLogger.info('task.stream.speech_synthesized', {
+        ...identity,
+        responseId,
+        bytes: audio.pcm.length,
+        sampleRate: audio.sampleRate,
+      })
+      terminalSpeechFidelity.recordSynthesized(identity)
+      // Held like a verified realtime utterance so the lifecycle terminal
+      // still precedes the answer's audio.done.
+      terminalSpeechGate.open(responseId, { expected: text, identity })
+      terminalSpeechGate.hold(responseId, {
+        type: 'audio.done', responseId, turnId: context.turnId,
+      })
+      heldFinalUtterances.set(
+        TerminalSpeechFidelity.key(identity), responseId,
+      )
+      return true
+    }
+
+    const codexStreamProjector = new CodexStreamProjector({
+      speak: speakTaskAnswer,
       onSegment: segment => {
         taskStreamProtocol.audio(segment, {
           segmentSequence: segment.sequence,
@@ -436,22 +635,34 @@ export function attachRealtimeGateway(server, {
       },
       onDone: result => {
         const fidelity = terminalSpeechFidelity.take(result)
-        // `null` means nothing was spoken under this identity (fallback or
-        // text-only delivery); only a real divergence sets verbatim false.
-        const verbatim = fidelity ? fidelity.verbatim : null
-        if (fidelity && !fidelity.verbatim) {
+        // What actually reached the ear. Rewritten attempts were discarded
+        // unheard, so `delivery` describes the surviving utterance:
+        // 'verbatim', 'synthesized', or null when no audio was delivered.
+        const delivery = fidelity?.delivery ?? null
+        // Kept for the frame contract ESS-1157 asserts on: true once an answer
+        // was delivered as written, false when none could be.
+        const verbatim = fidelity ? fidelity.delivered : null
+        if (fidelity?.divergences.length) {
           connectionLogger.warn('task.stream.speech_not_verbatim', {
             taskId: result.taskId,
             sessionId: result.sessionId,
             generation: result.generation,
             segments: fidelity.segments,
             divergences: fidelity.divergences.length,
+            delivery,
           })
         }
+        // The lifecycle terminal is written first, then the answer's held
+        // audio is released, so the unique final audio.done follows the
+        // terminal (ESS-1157 §3). The barrier ESS-1110 asks for is stronger
+        // here, not weaker: the terminal is written only once the answer has
+        // been generated AND verified, and the audio it gates is already in
+        // hand.
         taskStreamProtocol.responseDone(result, {
           finalAudioSequence: result.final_sequence,
           streamingFallbackReason: result.streaming_fallback_reason,
           verbatim,
+          delivery,
         })
         send(ws, {
           type: result.aborted ? 'task.stream.aborted' : 'task.stream.done',
@@ -460,7 +671,9 @@ export function attachRealtimeGateway(server, {
           final_sequence: result.final_sequence,
           streaming_fallback_reason: result.streaming_fallback_reason,
           verbatim,
+          delivery,
         })
+        releaseHeldUtterance(result)
       },
       onFallback: result => {
         connectionLogger.warn('task.streaming_fallback', result)
@@ -851,6 +1064,18 @@ export function attachRealtimeGateway(server, {
       deliverySequence: context.deliverySequence,
     })
 
+    /**
+     * Send a response frame, unless that response is still being verified.
+     *
+     * A gated response's frames are buffered until the utterance is known to
+     * be the answer; a rewritten one is dropped whole, so nothing the listener
+     * would perceive ever leaves here unverified (ESS-1165).
+     */
+    const sendOrHold = (id, frame) => {
+      if (terminalSpeechGate.hold(id, frame)) return true
+      return send(ws, frame)
+    }
+
     const fallbackResponseContext = () => ({
       turnId: committedTurnId || turnId,
       taskId: null,
@@ -1012,6 +1237,15 @@ export function attachRealtimeGateway(server, {
         id,
         responseActivityContextPatch({ existing, event, fallback }),
       )
+      // A task answer is held from its very first frame: the gate must exist
+      // before any audio delta arrives, or part of an unverified utterance
+      // would already be on the wire.
+      if (context.verbatimSpeech) {
+        terminalSpeechGate.open(id, {
+          expected: context.verbatimSpeech.text,
+          identity: context.verbatimSpeech,
+        })
+      }
       // Compatible Realtime servers may omit response.created and reveal the
       // correlation only on response.done. If audio already reached the
       // client, confirm the newly identified task notification immediately.
@@ -1312,7 +1546,12 @@ export function attachRealtimeGateway(server, {
           void codexStreamProjector.terminal(terminalIdentity).then(result => {
             const streamed = !(
               event.type === 'task.failed'
-              || result.streaming_fallback_reason
+              // A reading the model would not do faithfully still delivered the
+              // answer, as text. Handing it back would only let the
+              // announcement surface narrate it in the model's own words —
+              // the very failure ESS-1165 is about.
+              || (result.streaming_fallback_reason
+                && result.streaming_fallback_reason !== 'speech_not_verbatim')
               || !outputEnabled
               || !frontend?.ready
             )
@@ -1547,7 +1786,7 @@ export function attachRealtimeGateway(server, {
               sequence: responseContext.streamSequence,
               ...metric,
             })
-            send(ws, {
+            sendOrHold(id, {
               type: 'task.stream.first_audio',
               taskId: responseContext.taskId,
               sequence: responseContext.streamSequence,
@@ -1561,7 +1800,7 @@ export function attachRealtimeGateway(server, {
             origin: responseContext.origin || 'model',
           })
         }
-        send(ws, {
+        sendOrHold(id, {
           type: 'audio.delta',
           audio: event.delta,
           sampleRate: Number(event.sampleRate)
@@ -1690,31 +1929,31 @@ export function attachRealtimeGateway(server, {
           // tracked — silently treated as unsuppressed everywhere downstream.
           contextKnown: Boolean(responseContext),
         })
+        // Decide whether this utterance is the answer while it is still held.
+        // The verdict has to be in place before the projector's speak
+        // continuation reads it — it is, because the provider settles that
+        // promise in this same synchronous dispatch and its continuation is a
+        // microtask that cannot run until this handler returns.
+        if (terminalSpeechGate.isOpen(id)) {
+          if (responseFailed || responseContext?.suppressed) {
+            terminalSpeechGate.discard(id, responseStatus || 'suppressed')
+          } else {
+            terminalSpeechGate.settle(id, {
+              spoken: responseContext?.assistantTranscript || '',
+            })
+          }
+        }
         const responseDoneEvent = publicResponseDoneEvent({
           responseId: id,
           context: responseContext,
           status: responseStatus,
         })
-        if (responseDoneEvent) send(ws, responseDoneEvent)
+        if (responseDoneEvent) sendOrHold(id, responseDoneEvent)
         toolCalls.finishToolResponse(id, {
           suppressResponse,
         }).catch(error => {
           send(ws, { type: 'error', message: error.message })
         })
-        // A task answer must be read, not re-authored. Compare what the model
-        // actually said with the text it was handed, so a divergence is a
-        // machine-checkable frame instead of something only a listener notices.
-        // This must settle before the projector drains — it does, because the
-        // provider settles the speak promise in the same synchronous dispatch
-        // and its continuation is a microtask.
-        const verbatimSpeech = responseContext?.verbatimSpeech
-        if (verbatimSpeech && !responseFailed && !responseContext?.suppressed) {
-          responseContext.verbatimSpeech = null
-          terminalSpeechFidelity.record(verbatimSpeech, {
-            expected: verbatimSpeech.text,
-            spoken: responseContext?.assistantTranscript || '',
-          })
-        }
         // Guards run before the context is retired below, which drops the
         // transcript they inspect. They can only ask the model to reconsider;
         // they never execute tools or mutate task state directly.
@@ -1726,9 +1965,11 @@ export function attachRealtimeGateway(server, {
           transcript: responseContext?.assistantTranscript || '',
         })
         if (!responseContext?.suppressed) {
-          send(ws, { type: 'audio.done', responseId: id, turnId: responseTurnId })
+          sendOrHold(id, {
+            type: 'audio.done', responseId: id, turnId: responseTurnId,
+          })
           if (!responseContext?.hasAudio) {
-            send(ws, {
+            sendOrHold(id, {
               type: 'voice.state',
               state: 'idle',
               turnId: responseTurnId,
@@ -2668,6 +2909,10 @@ export function attachRealtimeGateway(server, {
       // In-flight streamed answers die with the socket; hand their claims back
       // so another delivery surface can still deliver them exactly once.
       terminalDelivery.close()
+      // Anything still awaiting verification cannot be delivered now, and it
+      // was never sent, so it is dropped rather than flushed.
+      terminalSpeechGate.close()
+      heldFinalUtterances.clear()
       clearResponseCandidate()
       turnGeneration = ++turnSequence
       committedTurnGeneration = turnGeneration

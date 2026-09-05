@@ -16,6 +16,9 @@
 //   old speak shape       0/4 knowledge segments verbatim (rewrites, refusals)
 //   verbatim shape        4/4 verbatim
 //   verbatim, one shot    weather and knowledge answers read exactly
+//   deterministic TTS     qwen-tts returns mono/16-bit/24 kHz PCM, the exact
+//                         downlink contract, so the recovery path needs no
+//                         resampling
 
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -28,6 +31,7 @@ import {
   verbatimSpeechInstructions,
 } from '../src/voice/frontend-tools.mjs'
 import { isVerbatimSpeech } from '../src/voice/terminal-speech-fidelity.mjs'
+import { DeterministicSpeech } from '../src/voice/deterministic-speech.mjs'
 
 const ENABLED = process.env.QWEN_AUDIO_E2E === '1'
   && Boolean(process.env.DASHSCOPE_API_KEY)
@@ -208,4 +212,18 @@ test('the real model reads a complete answer as one utterance', {
     isVerbatimSpeech(WEATHER_ANSWER, weather),
     `the weather answer was not read verbatim:\n  got ${weather}`,
   )
+})
+
+test('the deterministic recovery path produces downlink-ready audio', {
+  skip: ENABLED ? false : 'set QWEN_AUDIO_E2E=1 and DASHSCOPE_API_KEY to run',
+}, async () => {
+  // The recovery path only helps if what it returns can be played as-is. This
+  // pins the real service's container against the downlink's PCM contract, so
+  // a format change is caught here rather than as silence on the watch.
+  const speech = new DeterministicSpeech({ sampleRate: 24000 })
+  assert.equal(speech.available, true, 'deterministic TTS must be configured')
+  const audio = await speech.synthesize(WEATHER_ANSWER)
+  assert.equal(audio.sampleRate, 24000)
+  assert.ok(audio.pcm.length > 24000, 'a full answer is more than half a second')
+  assert.equal(audio.pcm.length % 2, 0, '16-bit samples are whole')
 })
