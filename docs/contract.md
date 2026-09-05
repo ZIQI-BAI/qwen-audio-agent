@@ -96,7 +96,10 @@ other outcome releases the claim instead of spending it.
 Frame order is unchanged: the lifecycle terminal still waits for the task and
 the response/audio drain, and `task.stream.done` is the last frame of the task
 stream. The hold sits inside that barrier rather than moving it — it decides
-*whether* an utterance is released, not *when* the terminal is written.
+*whether* an utterance is released, not *when* the terminal is written. That
+holds on every branch: when speech is withheld, `task.stream.fallback` is sent
+**before** the lifecycle terminal, because the terminal and `task.stream.done`
+close the stream and nothing may follow them.
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`, `listSkins`, `removeSkin`, `effectiveOrbSkin`, `skinsDirectory`, `validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`, `configureOrbWindow`, `ORB_CHANNELS` |
