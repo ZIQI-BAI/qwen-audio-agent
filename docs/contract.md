@@ -83,8 +83,12 @@ transcript: audio published without one is `speech_unverifiable` and is
 withheld too, because releasing it would assert a fidelity nobody measured.
 Punctuation and spacing are tolerated, but never next to a digit — a dropped
 sign, range, decimal or colon is a different number, not a rendering choice.
-The lifecycle terminal and `task.stream.done` precede the single `audio.done`,
-which is the turn's last frame.
+The lifecycle terminal stays behind the response/audio drain barrier
+(ESS-1110), so it follows the answer's single `audio.done`, and
+`task.stream.done` is the task stream's last frame. Withheld speech is not a
+delivery: the task's notification claim goes back to pending instead of being
+marked delivered, except on a text-only client where the text frame is the
+delivery.
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`, `listSkins`, `removeSkin`, `effectiveOrbSkin`, `skinsDirectory`, `validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`, `configureOrbWindow`, `ORB_CHANNELS` |

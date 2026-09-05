@@ -69,9 +69,10 @@ Gateway 暂存，直到提供方自己的 transcript 与该文本一致才放行
 `speech_truncated` / `speech_missing`。核验依赖提供方自己的 transcript：
 只有音频而没有 transcript 记为 `speech_unverifiable`，同样不播报——放行它
 等于断言一个没人测过的一致性。标点与空白可以容忍，但紧邻数字时不容忍：
-被丢掉的正负号、区间、小数点或冒号是另一个数值，不是排版差异。生命周期
-终态与 `task.stream.done` 位于唯一 `audio.done` 之前，`audio.done` 是该
-turn 的最后一帧。
+被丢掉的正负号、区间、小数点或冒号是另一个数值，不是排版差异。生命周期终态仍压在
+响应/音频 drain 屏障之后（ESS-1110），位于答案唯一 `audio.done` 之后，
+`task.stream.done` 是任务流最后一帧。不播报不算交付：该任务的通知 claim
+退回 pending，不标记为已交付；纯文本客户端例外，其文本帧即交付。
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`、`listSkins`、`removeSkin`、`effectiveOrbSkin`、`skinsDirectory`、`validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`、`configureOrbWindow`、`ORB_CHANNELS` |

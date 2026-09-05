@@ -380,7 +380,15 @@ async function runDelegatedTurn({
   await new Promise(resolve => server.close(resolve))
   await upstream.close()
 
-  return { taskId: created.id, turnId, frames, renderings: upstream.renderings }
+  return {
+    taskId: created.id,
+    turnId,
+    frames,
+    renderings: upstream.renderings,
+    // Read after the socket closed, so it reflects the settled delivery.
+    notificationStatus: taskManager.get(created.id, { ownerId: 'user_personal' })
+      ?.notificationStatus,
+  }
 }
 
 const assistantTranscripts = (frames, taskId) => frames
@@ -503,7 +511,7 @@ test('a rendering that appends its own words to the answer is rejected', async (
   assert.equal(fallbacks[0].streaming_fallback_reason, 'speech_expanded')
 })
 
-test('the verified answer ends the turn: terminal first, one audio.done last', async () => {
+test('the verified answer is delivered once, behind the ESS-1110 drain barrier', async () => {
   const { taskId, frames } = await runDelegatedTurn({
     answerText: WEATHER_ANSWER,
     sessionId: 'ess1165-order',
@@ -524,13 +532,35 @@ test('the verified answer ends the turn: terminal first, one audio.done last', a
   )
   const audioDones = frames.filter(frame => frame.type === 'audio.done')
   assert.equal(audioDones.length, 1, 'exactly one final TTS')
+
+  // ESS-1165 asked for the lifecycle terminal to precede `audio.done`. The
+  // ESS-1168 architecture review adjudicated that request against ESS-1110
+  // (`33424da`), which requires the terminal to sit behind the response/audio
+  // drain barrier, and upheld ESS-1110. So the terminal follows the answer's
+  // audio, and what this turn guarantees instead is: one `audio.done`, no
+  // task stream frame after the terminal, and `task.stream.done` last on the
+  // task stream.
+  const terminal = lifecycleTerminals(frames, taskId)[0]
   assert.ok(
-    frames.indexOf(lifecycleTerminals(frames, taskId)[0]) < frames.indexOf(audioDones[0]),
-    'the lifecycle terminal precedes the final audio.done',
+    frames.indexOf(audioDones[0]) < frames.indexOf(terminal),
+    'the lifecycle terminal sits behind the audio drain barrier (ESS-1110)',
+  )
+  const taskStreamFrames = frames.filter(frame => (
+    ['task.stream', 'task.stream.done', 'task.stream.aborted', 'task.stream.fallback']
+      .includes(frame.type)
+    && frame.taskId === taskId
+  ))
+  assert.equal(
+    taskStreamFrames.at(-1).type, 'task.stream.done',
+    'task.stream.done is the last frame of the task stream',
   )
   assert.equal(
-    frames.at(-1), audioDones[0],
-    `audio.done must be the turn's last frame; saw ${frames.at(-1)?.type} after it`,
+    taskStreamFrames.filter(frame => (
+      taskStreamFrames.indexOf(frame) > taskStreamFrames.indexOf(terminal)
+      && frame.type === 'task.stream'
+    )).length,
+    0,
+    'no task stream frame follows the terminal',
   )
   assert.equal(
     frames.filter(frame => frame.type === 'task.stream.fallback').length, 0,
@@ -612,4 +642,39 @@ test('a rendering that drops a minus sign is a divergence, not a match', async (
   const fallbacks = frames.filter(frame => frame.type === 'task.stream.fallback')
   assert.equal(fallbacks.length, 1)
   assert.equal(fallbacks[0].streaming_fallback_reason, 'speech_rewritten')
+})
+
+// ESS-1168 finding 1: a fidelity verdict that is only reported changes
+// nothing. `markNotificationsDelivered` asserts the user received the answer,
+// so a withheld rendering must not reach it — otherwise the task's one
+// notification is consumed and the authoritative result is simply lost, which
+// is the other half of ESS-1165's "duplicated or lost".
+test('withheld speech does not mark the notification delivered', async () => {
+  const { taskId, frames, notificationStatus } = await runDelegatedTurn({
+    answerText: KNOWLEDGE_ANSWER,
+    sessionId: 'ess1165-undelivered',
+    behaviour: () => PROGRESS_FILLER,
+  })
+
+  assert.equal(frames.filter(frame => frame.type === 'audio.delta').length, 0)
+  assert.notEqual(
+    notificationStatus, 'delivered',
+    'a result nobody heard was not delivered',
+  )
+  assert.equal(
+    notificationStatus, 'pending',
+    'the claim goes back so the result stays deliverable',
+  )
+  assert.equal(finalAnswerText(frames, taskId).length, 1)
+})
+
+test('a verified answer does mark the notification delivered', async () => {
+  const { notificationStatus, frames } = await runDelegatedTurn({
+    answerText: KNOWLEDGE_ANSWER,
+    sessionId: 'ess1165-delivered',
+    behaviour: script => script,
+  })
+
+  assert.ok(frames.filter(frame => frame.type === 'audio.delta').length > 0)
+  assert.equal(notificationStatus, 'delivered')
 })

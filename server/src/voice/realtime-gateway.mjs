@@ -916,9 +916,6 @@ export function attachRealtimeGateway(server, {
       const held = context.heldAudio || []
       context.heldAudio = []
       context.verbatimReleased = true
-      // Playback state for this response is emitted here, not from the
-      // client's playback receipts, which would land after `audio.done`.
-      context.ownsPlaybackState = true
       const responseTurnId = context.turnId || turnId
       const origin = context.origin || 'model'
       if (held.length) {
@@ -951,12 +948,6 @@ export function attachRealtimeGateway(server, {
         context.hasAudio = true
         playbackTurns.set(id, responseTurnId)
         announcementWindow.queueAudio(id, { turnId: responseTurnId, origin })
-        send(ws, {
-          type: 'voice.state',
-          state: 'speaking',
-          turnId: responseTurnId,
-          origin,
-        })
         for (const frame of held) {
           send(ws, {
             type: 'audio.delta',
@@ -1037,9 +1028,13 @@ export function attachRealtimeGateway(server, {
         suppressed: false,
         failed: Boolean(responseFailed),
       })
-      // A verified rendering stays held until the delivery has written its
-      // lifecycle terminal; only then is the audio released.
-      if (!verdict.ok) discardVerbatimAudio(id)
+      // Verified audio is released here, at the response barrier. ESS-1110
+      // (`33424da`) requires the lifecycle terminal to sit behind the
+      // response/audio drain barrier, and the ESS-1168 architecture review
+      // upheld that order against ESS-1165's request to invert it, so the
+      // terminal follows this audio rather than preceding it.
+      if (verdict.ok) releaseVerbatimAudio(id)
+      else discardVerbatimAudio(id)
     }
 
     /**
@@ -1086,7 +1081,6 @@ export function attachRealtimeGateway(server, {
       if (!rendering.responseId) {
         return { completed: false, status: rendering.reason }
       }
-      releaseVerbatimAudio(rendering.responseId)
       return { completed: true, responseId: rendering.responseId }
     }
 
@@ -1120,18 +1114,12 @@ export function attachRealtimeGateway(server, {
       if (context?.suppressed) return
       announcementWindow.startPlayback(id)
       const playbackTurnId = context?.turnId || playbackTurns.get(id) || turnId
-      // A verified final answer emitted its own speaking state before the
-      // audio, so that `audio.done` can stay the turn's last frame. The
-      // client's playback receipt must not append another state frame after
-      // it (ESS-1165).
-      if (!context?.ownsPlaybackState) {
-        send(ws, {
-          type: 'voice.state',
-          state: 'speaking',
-          turnId: playbackTurnId,
-          origin: context?.origin || 'model',
-        })
-      }
+      send(ws, {
+        type: 'voice.state',
+        state: 'speaking',
+        turnId: playbackTurnId,
+        origin: context?.origin || 'model',
+      })
       if (!context || context.playbackStarted) return
       context.playbackStarted = true
       if (confirmsTaskNotificationOnPlaybackStart(context)) {
@@ -1263,14 +1251,12 @@ export function attachRealtimeGateway(server, {
           scheduleResponseContextCleanup(id, context)
         }
       }
-      if (!context?.ownsPlaybackState) {
-        send(ws, {
-          type: 'voice.state',
-          state: userSpeaking ? 'listening' : 'idle',
-          turnId: userSpeaking ? turnId : playbackTurnId,
-          origin: context?.origin || 'model',
-        })
-      }
+      send(ws, {
+        type: 'voice.state',
+        state: userSpeaking ? 'listening' : 'idle',
+        turnId: userSpeaking ? turnId : playbackTurnId,
+        origin: context?.origin || 'model',
+      })
       const timer = setTimeout(
         () => announcements.flush(),
         config.announcementQuietMs,
@@ -1341,10 +1327,34 @@ export function attachRealtimeGateway(server, {
           streaming_fallback_reason: fallbackReason,
         })
       }
-      const voiceUnavailable = fallbackReason === 'voice_output_unavailable'
-      terminalDelivery.settle(identity, { delivered: !voiceUnavailable })
-      if (voiceUnavailable) claimPendingNotifications([task.id])
-      if (spoke) releaseVerbatimAudio(rendering.responseId)
+      // The fidelity verdict decides delivery, it is not merely reported
+      // (ESS-1168 finding 1). Marking a notification delivered asserts the
+      // user got the answer; withheld speech means a voice surface got
+      // nothing, so the claim goes back and the result stays pending instead
+      // of being consumed. A text-only client is the exception: for it the
+      // authoritative text frame IS the delivery, spoken or not.
+      const delivered = spoke || nonVoiceClient
+      terminalDelivery.settle(identity, { delivered })
+      if (!delivered) {
+        connectionLogger.warn('task.final_answer_undelivered', {
+          taskId: identity.taskId,
+          turnId: identity.turnId,
+          generation: identity.generation,
+          reason: fallbackReason,
+        })
+      }
+      // Deliberately NOT re-claimed here. The announcement surface renders a
+      // result by letting the model reword it, which is the path ESS-1165
+      // removed; handing this task straight back to it would speak an
+      // unverified answer instead of the withheld one. The notification stays
+      // pending for a delivery surface that can render it verbatim.
+      //
+      // Voice output being switched off on this connection is not a fidelity
+      // failure, so that case keeps the pre-existing hand-off to the
+      // announcement/offline surface rather than adopting the rule above.
+      if (!delivered && fallbackReason === 'voice_output_unavailable') {
+        claimPendingNotifications([task.id])
+      }
     }
 
     const unsubscribeTasks = taskManager.subscribe(event => {
