@@ -23,12 +23,41 @@
 // Punctuation, quoting and whitespace are rendering choices a TTS pass may
 // legitimately normalise; they carry no meaning for "did it say the answer".
 // Everything else — words, numbers, order — must match exactly.
-const IGNORED_CHARACTERS = new RegExp(
-  '[\\s\\p{P}\\p{S}]+',
-  'gu',
-)
+//
+// The set is an explicit allowlist rather than the `\p{P}\p{S}` classes,
+// because those classes contain characters that carry the whole meaning of a
+// number: `10+2=12` and `10212` normalise to the same string once `+` and `=`
+// are dropped, and so do `-3°C` and `3°C`. A wrong number that reads as a
+// match is exactly the failure this module exists to prevent, so every
+// mathematical, unit and currency symbol stays significant.
+const IGNORABLE_PUNCTUATION = new Set([
+  ...'。．.，、,；;：:！!？?…‥·',
+  ...'「」『』《》〈〉（）()［］[]｛｝{}【】',
+  ...'“”‘’"\'`«»',
+  ...'—–‒―-−~',
+])
+
+const DIGIT = /\p{Nd}/u
 
 export const VERBATIM_SPEECH_ATTEMPTS = 2
+
+/**
+ * True when the character next to `index` in direction `step`, skipping
+ * whitespace, is a digit.
+ *
+ * Even the allowlisted punctuation is load-bearing between digits: a dash is
+ * a sign or a range (`-3`, `3-5`), a colon is a time (`3:05`), a period is a
+ * decimal. Adjacency to a digit is what promotes such a character back to
+ * significant.
+ */
+function touchesDigit(source, index, step) {
+  for (let at = index + step; at >= 0 && at < source.length; at += step) {
+    const character = source[at]
+    if (/\s/u.test(character)) continue
+    return DIGIT.test(character)
+  }
+  return false
+}
 
 /**
  * Reduces a rendered utterance to the characters that decide whether the
@@ -36,10 +65,19 @@ export const VERBATIM_SPEECH_ATTEMPTS = 2
  * product names) from failing on capitalisation alone.
  */
 export function normalizeSpeech(text) {
-  return String(text ?? '')
-    .normalize('NFKC')
-    .replace(IGNORED_CHARACTERS, '')
-    .toLowerCase()
+  const source = String(text ?? '').normalize('NFKC')
+  let normalized = ''
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]
+    if (/\s/u.test(character)) continue
+    if (
+      IGNORABLE_PUNCTUATION.has(character)
+      && !touchesDigit(source, index, -1)
+      && !touchesDigit(source, index, 1)
+    ) continue
+    normalized += character
+  }
+  return normalized.toLowerCase()
 }
 
 /**

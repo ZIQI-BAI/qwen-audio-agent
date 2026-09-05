@@ -66,8 +66,12 @@ Codex 委托语音流先发布有序的 `task.stream.segment`，仅在 ACP 终�
 Gateway 暂存，直到提供方自己的 transcript 与该文本一致才放行。被模型改写、
 扩写、截断或替换的朗读在任何音频下发之前丢弃，重试一次，仍不一致则不播报，
 并以 `task.stream.fallback` 上报 `speech_rewritten` / `speech_expanded` /
-`speech_truncated` / `speech_missing`。生命周期终态与 `task.stream.done`
-位于唯一 `audio.done` 之前，`audio.done` 是该 turn 的最后一帧。
+`speech_truncated` / `speech_missing`。核验依赖提供方自己的 transcript：
+只有音频而没有 transcript 记为 `speech_unverifiable`，同样不播报——放行它
+等于断言一个没人测过的一致性。标点与空白可以容忍，但紧邻数字时不容忍：
+被丢掉的正负号、区间、小数点或冒号是另一个数值，不是排版差异。生命周期
+终态与 `task.stream.done` 位于唯一 `audio.done` 之前，`audio.done` 是该
+turn 的最后一帧。
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`、`listSkins`、`removeSkin`、`effectiveOrbSkin`、`skinsDirectory`、`validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`、`configureOrbWindow`、`ORB_CHANNELS` |

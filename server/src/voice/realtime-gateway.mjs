@@ -996,18 +996,17 @@ export function attachRealtimeGateway(server, {
       responseTurnId,
     }) => {
       const spoken = context.assistantTranscript || ''
-      // A provider that rendered audio but published no transcript cannot be
-      // checked. That is a provider capability gap, not a divergence: the
-      // audio is released and the gap is logged, rather than silencing the
-      // answer on every such provider. A response with neither audio nor
-      // transcript said nothing and is a plain failure.
-      const unverifiable = !context.transcriptDone
-        && !spoken.trim()
-        && Boolean(context.heldAudio?.length)
+      // Audio with no transcript cannot be checked against the answer, so it
+      // is not evidence of anything. Releasing it would mean asserting a
+      // fidelity nobody measured — the same unverified delivery this path
+      // exists to remove — so it is treated as a divergence and the answer is
+      // delivered as text instead. A provider that renders speech must publish
+      // a transcript to use the spoken path.
+      const unverifiable = !spoken.trim() && Boolean(context.heldAudio?.length)
       const verdict = responseFailed
         ? { ok: false, reason: responseStatus || 'response_failed' }
         : unverifiable
-          ? { ok: true, reason: null, unverified: true }
+          ? { ok: false, reason: 'speech_unverifiable' }
           : verbatimVerdict(context.verbatimSpeech, spoken)
       verbatimVerdicts.set(id, { ...verdict, spoken })
       context.responseDone = true
@@ -1019,7 +1018,6 @@ export function attachRealtimeGateway(server, {
           taskId: context.taskId || null,
           attempt: context.verbatimAttempt || 1,
           reason: verdict.reason || null,
-          unverified: Boolean(verdict.unverified),
           intendedLength: verdict.intendedLength ?? null,
           spokenLength: verdict.spokenLength ?? null,
           spoken: verdict.ok ? undefined : spoken.slice(0, 200),
@@ -1065,7 +1063,7 @@ export function attachRealtimeGateway(server, {
         const verdict = responseId ? verbatimVerdicts.get(responseId) : null
         if (responseId) verbatimVerdicts.delete(responseId)
         if (outcome?.completed && verdict?.ok) {
-          return { responseId, unverified: Boolean(verdict.unverified) }
+          return { responseId }
         }
         reason = verdict?.reason
           || outcome?.status

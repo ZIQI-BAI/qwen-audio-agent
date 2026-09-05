@@ -572,24 +572,44 @@ test('a rendering that produced nothing is a failure, not a silent delivery', as
   assert.equal(lifecycleTerminals(frames, taskId).length, 1)
 })
 
-test('a provider that publishes no transcript is not silenced by the check', async () => {
-  // Verification needs the provider's own transcript. A provider that renders
-  // audio without one (some speech-to-speech pipelines) must keep working:
-  // the gap is logged, not turned into permanent silence.
-  const { taskId, frames } = await runDelegatedTurn({
+test('audio nobody could check is withheld, not released on trust', async () => {
+  // Verification needs the provider's own transcript. Without one there is no
+  // evidence the audio says the answer, and releasing it would assert a
+  // fidelity nobody measured — the very thing this path removes. The answer
+  // still reaches the user as text, and the gap is reported.
+  const { taskId, frames, renderings } = await runDelegatedTurn({
     answerText: WEATHER_ANSWER,
     sessionId: 'ess1165-no-transcript',
     behaviour: script => script,
     publishesTranscript: false,
   })
 
-  assert.ok(
-    frames.filter(frame => frame.type === 'audio.delta').length > 0,
-    'the answer is still spoken',
-  )
+  assert.equal(renderings.length, 2, 'an unverifiable rendering is retried')
   assert.equal(
-    frames.filter(frame => frame.type === 'task.stream.fallback').length, 0,
+    frames.filter(frame => frame.type === 'audio.delta').length, 0,
+    'unverifiable audio never reaches the client',
   )
-  assert.equal(frames.filter(frame => frame.type === 'audio.done').length, 1)
+  const fallbacks = frames.filter(frame => frame.type === 'task.stream.fallback')
+  assert.equal(fallbacks.length, 1)
+  assert.equal(fallbacks[0].streaming_fallback_reason, 'speech_unverifiable')
+  assert.equal(finalAnswerText(frames, taskId).length, 1)
+  assert.equal(finalAnswerText(frames, taskId)[0].delta, WEATHER_ANSWER)
   assert.equal(lifecycleTerminals(frames, taskId).length, 1)
+})
+
+test('a rendering that drops a minus sign is a divergence, not a match', async () => {
+  // The normaliser tolerates punctuation, which is what makes this dangerous:
+  // dropping `-` would make a below-zero temperature read as an above-zero one.
+  const BELOW_ZERO = '今晚最低温度是 -3°C，请注意保暖。'
+  const { taskId, frames } = await runDelegatedTurn({
+    answerText: BELOW_ZERO,
+    sessionId: 'ess1165-sign-loss',
+    behaviour: () => '今晚最低温度是 3°C，请注意保暖。',
+  })
+
+  assert.deepEqual(assistantTranscripts(frames, taskId), [])
+  assert.equal(frames.filter(frame => frame.type === 'audio.delta').length, 0)
+  const fallbacks = frames.filter(frame => frame.type === 'task.stream.fallback')
+  assert.equal(fallbacks.length, 1)
+  assert.equal(fallbacks[0].streaming_fallback_reason, 'speech_rewritten')
 })
