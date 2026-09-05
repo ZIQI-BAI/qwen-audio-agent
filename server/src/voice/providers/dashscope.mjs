@@ -8,6 +8,7 @@ import {
   frontendTools,
   resultResponseInstructions,
   speakResponseInstructions,
+  verbatimSpeechInstructions,
   permissionResponseInstructions,
 } from '../frontend-tools.mjs'
 import { isRecoverableRealtimeInactivityError } from '../realtime-errors.mjs'
@@ -96,6 +97,19 @@ export const dashscopeProvider = {
     conversation: 'none',
     modalities: responseModalities(activeModelProfile()),
     instructions: speakResponseInstructions(content),
+  }),
+
+  // A task's authoritative final answer. Two properties separate it from
+  // `buildSpeakResponse`: an explicit empty `input`, because an out-of-band
+  // response otherwise still takes the whole conversation as its input and
+  // re-answers the user's question from it (ESS-1165), and reader instructions
+  // that forbid rewriting.
+  buildVerbatimSpeechResponse: content => ({
+    conversation: 'none',
+    input: [],
+    tool_choice: 'none',
+    modalities: responseModalities(activeModelProfile()),
+    instructions: verbatimSpeechInstructions(content),
   }),
 
   buildResultInjection: content => ({

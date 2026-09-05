@@ -4,6 +4,7 @@ import {
   frontendTools,
   resultResponseInstructions,
   speakResponseInstructions,
+  verbatimSpeechInstructions,
   permissionResponseInstructions,
 } from '../frontend-tools.mjs'
 import { gaRealtimeProtocol } from './ga-protocol.mjs'
@@ -99,6 +100,16 @@ export const s2sProvider = {
     conversation: 'none',
     modalities: ['audio'],
     instructions: speakResponseInstructions(content),
+    tool_choice: 'none',
+  }),
+
+  // See dashscope.buildVerbatimSpeechResponse (ESS-1165): a task's final answer
+  // is read, not re-authored, so it carries no conversation input.
+  buildVerbatimSpeechResponse: content => ({
+    conversation: 'none',
+    input: [],
+    modalities: ['audio'],
+    instructions: verbatimSpeechInstructions(content),
     tool_choice: 'none',
   }),
 

@@ -13,6 +13,8 @@ const CORRELATED_CONTEXT_FIELDS = [
   'consumesTaskNotification',
   'streamSequence',
   'streamSegmentStartedAt',
+  // What this response was asked to read out verbatim, if anything (ESS-1165).
+  'verbatimSpeech',
 ]
 
 /**

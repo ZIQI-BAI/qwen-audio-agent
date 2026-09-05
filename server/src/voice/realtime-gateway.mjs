@@ -34,6 +34,7 @@ import {
   mergeResponseContext,
   responseActivityContextPatch,
 } from './response-context.mjs'
+import { TerminalSpeechFidelity } from './terminal-speech-fidelity.mjs'
 import {
   ActiveVoiceClients,
   clientVoiceCapabilities,
@@ -403,12 +404,22 @@ export function attachRealtimeGateway(server, {
       ),
       log: connectionLogger,
     })
+    // A task answer is authoritative content, so it is read out, not
+    // re-authored, and every utterance is checked against the text it was asked
+    // to read (ESS-1165).
+    const terminalSpeechFidelity = new TerminalSpeechFidelity()
     const codexStreamProjector = new CodexStreamProjector({
-      speak: (text, context) => frontend.speak(text, 'agent', {
+      speak: (text, context) => frontend.speakVerbatim(text, 'agent', {
         turnId: context.turnId,
         taskId: context.taskId,
         streamSequence: context.sequence,
         streamSegmentStartedAt: Date.now(),
+        verbatimSpeech: {
+          text,
+          sessionId: context.sessionId,
+          taskId: context.taskId,
+          generation: context.generation,
+        },
       }),
       onSegment: segment => {
         taskStreamProtocol.audio(segment, {
@@ -424,9 +435,23 @@ export function attachRealtimeGateway(server, {
         })
       },
       onDone: result => {
+        const fidelity = terminalSpeechFidelity.take(result)
+        // `null` means nothing was spoken under this identity (fallback or
+        // text-only delivery); only a real divergence sets verbatim false.
+        const verbatim = fidelity ? fidelity.verbatim : null
+        if (fidelity && !fidelity.verbatim) {
+          connectionLogger.warn('task.stream.speech_not_verbatim', {
+            taskId: result.taskId,
+            sessionId: result.sessionId,
+            generation: result.generation,
+            segments: fidelity.segments,
+            divergences: fidelity.divergences.length,
+          })
+        }
         taskStreamProtocol.responseDone(result, {
           finalAudioSequence: result.final_sequence,
           streamingFallbackReason: result.streaming_fallback_reason,
+          verbatim,
         })
         send(ws, {
           type: result.aborted ? 'task.stream.aborted' : 'task.stream.done',
@@ -434,6 +459,7 @@ export function attachRealtimeGateway(server, {
           turnId: result.turnId,
           final_sequence: result.final_sequence,
           streaming_fallback_reason: result.streaming_fallback_reason,
+          verbatim,
         })
       },
       onFallback: result => {
@@ -1263,7 +1289,9 @@ export function attachRealtimeGateway(server, {
         if (!wasStreamed && finalSpeech) {
           taskStreamProtocol.text(terminalIdentity, finalSpeech)
           if (outputEnabled && frontend?.ready) {
-            codexStreamProjector.push(terminalIdentity, finalSpeech)
+            // The whole answer is already known, so it is spoken as a single
+            // utterance: one final transcript, one final TTS, one audio.done.
+            codexStreamProjector.pushComplete(terminalIdentity, finalSpeech)
             wasStreamed = true
           }
         }
@@ -1673,6 +1701,20 @@ export function attachRealtimeGateway(server, {
         }).catch(error => {
           send(ws, { type: 'error', message: error.message })
         })
+        // A task answer must be read, not re-authored. Compare what the model
+        // actually said with the text it was handed, so a divergence is a
+        // machine-checkable frame instead of something only a listener notices.
+        // This must settle before the projector drains — it does, because the
+        // provider settles the speak promise in the same synchronous dispatch
+        // and its continuation is a microtask.
+        const verbatimSpeech = responseContext?.verbatimSpeech
+        if (verbatimSpeech && !responseFailed && !responseContext?.suppressed) {
+          responseContext.verbatimSpeech = null
+          terminalSpeechFidelity.record(verbatimSpeech, {
+            expected: verbatimSpeech.text,
+            spoken: responseContext?.assistantTranscript || '',
+          })
+        }
         // Guards run before the context is retired below, which drops the
         // transcript they inspect. They can only ask the model to reconsider;
         // they never execute tools or mutate task state directly.

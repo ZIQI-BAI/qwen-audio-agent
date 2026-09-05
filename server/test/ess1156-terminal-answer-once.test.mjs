@@ -387,7 +387,10 @@ test('a streamed weather answer is spoken exactly once (ESS-1147 2x repeat)', as
   const segments = frames.filter(frame => (
     frame.type === 'task.stream.segment' && frame.taskId === taskId
   ))
-  assert.equal(segments.length, 2, 'the captured weather answer projects into 2 segments')
+  // One segment since ESS-1165: an answer that arrives complete is spoken as a
+  // single utterance. The 2 segments this case used to produce were 2 realtime
+  // responses, and the second is where the real model re-answered.
+  assert.equal(segments.length, 1, 'a complete answer projects into 1 segment')
   assert.equal(segments.map(item => item.text).join(''), WEATHER_ANSWER)
 
   const spoken = assistantTranscriptsFor(frames, taskId)
@@ -407,7 +410,8 @@ test('a streamed knowledge answer is spoken exactly once (ESS-1147 4x repeat)', 
   const segments = frames.filter(frame => (
     frame.type === 'task.stream.segment' && frame.taskId === taskId
   ))
-  assert.equal(segments.length, 4, 'the captured knowledge answer projects into 4 segments')
+  // See the weather case: one utterance, not the 4 segments of ESS-1156.
+  assert.equal(segments.length, 1, 'a complete answer projects into 1 segment')
   assert.equal(segments.map(item => item.text).join(''), KNOWLEDGE_ANSWER)
 
   const spoken = assistantTranscriptsFor(frames, taskId)
