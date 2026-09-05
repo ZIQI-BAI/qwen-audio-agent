@@ -158,7 +158,10 @@ function verbatimContent(instructions) {
  * the reader instructions and has its conversation input removed is read back
  * verbatim, as the real model does.
  */
-function startRealtimeUpstream({ rewrite, rewriteAttempts = 0, silent = false }) {
+function startRealtimeUpstream({
+  rewrite, rewriteAttempts = 0, silent = false,
+  render = null, publishesTranscript = true,
+}) {
   const server = createServer()
   const wss = new WebSocketServer({ server })
   const responses = []
@@ -195,7 +198,12 @@ function startRealtimeUpstream({ rewrite, rewriteAttempts = 0, silent = false })
       const refuses = asked && isolated
         ? ++verbatimRequests <= rewriteAttempts
         : true
-      const spoken = refuses ? rewrite : asked
+      // `render` models the shape of a divergence (expanded, truncated, …)
+      // rather than just "some other text", so each ESS-1165 failure mode has
+      // its own branch here.
+      const spoken = render && asked && isolated
+        ? render(asked, verbatimRequests)
+        : (refuses ? rewrite : asked)
       responses.push({ id, response, asked, isolated, spoken })
       ws.send(JSON.stringify({ type: 'response.created', response: { id } }))
       setTimeout(() => {
@@ -205,11 +213,15 @@ function startRealtimeUpstream({ rewrite, rewriteAttempts = 0, silent = false })
             type: 'response.audio.delta', response_id: id, delta: AUDIO_FRAME,
           }))
         }
-        ws.send(JSON.stringify({
-          type: 'response.audio_transcript.done',
-          response_id: id,
-          transcript: spoken,
-        }))
+        // A provider that renders audio but never publishes a transcript
+        // leaves the gateway with nothing to check the audio against.
+        if (publishesTranscript) {
+          ws.send(JSON.stringify({
+            type: 'response.audio_transcript.done',
+            response_id: id,
+            transcript: spoken,
+          }))
+        }
         ws.send(JSON.stringify({
           type: 'response.done',
           response: { id, status: 'completed' },
@@ -382,9 +394,12 @@ function waitFor(frames, predicate, timeoutMs = 8000) {
 
 async function runDelegatedTurn({
   answerText, rewrite, sessionId, rewriteAttempts = 0, silent = false,
+  render = null, publishesTranscript = true,
   terminalFrameType = 'task.stream.done',
 }) {
-  const upstream = await startRealtimeUpstream({ rewrite, rewriteAttempts, silent })
+  const upstream = await startRealtimeUpstream({
+    rewrite, rewriteAttempts, silent, render, publishesTranscript,
+  })
   const server = await startGateway(upstream.url)
   const { socket, frames } = await connectClient(server, sessionId)
   await waitFor(frames, frame => frame.type === 'voice.ready')
@@ -429,6 +444,61 @@ function notificationDelivered(frames, taskId) {
   return frames.some(frame => (
     frame.type === 'task.notification.delivered' && frame.task?.id === taskId
   ))
+}
+
+const TASK_STREAM_TYPES = [
+  'task.stream', 'task.stream.done', 'task.stream.aborted', 'task.stream.fallback',
+]
+
+/**
+ * The task stream ends exactly once, and nothing follows the end.
+ *
+ * ESS-1168 finding 1 was a withheld rendering reporting `task.stream.fallback`
+ * after `task.stream.done`: the assertions of the day only checked that a
+ * fallback existed, so a frame past the end of the stream went unnoticed. This
+ * has to hold on every divergence branch, not just the happy one.
+ */
+function assertStreamClosesLast(frames, taskId, { fallbackReason = null } = {}) {
+  const stream = frames.filter(frame => (
+    TASK_STREAM_TYPES.includes(frame.type) && frame.taskId === taskId
+  ))
+  const trace = stream
+    .map(frame => frame.type + (frame.category ? `:${frame.category}` : ''))
+    .join(' -> ')
+  const terminals = stream.filter(frame => (
+    frame.type === 'task.stream' && frame.category === 'terminal'
+  ))
+  const dones = stream.filter(frame => frame.type === 'task.stream.done')
+  assert.equal(terminals.length, 1, `exactly one lifecycle terminal; saw ${trace}`)
+  assert.equal(dones.length, 1, `exactly one task.stream.done; saw ${trace}`)
+  assert.ok(
+    stream.indexOf(terminals[0]) < stream.indexOf(dones[0]),
+    `the lifecycle terminal precedes task.stream.done; saw ${trace}`,
+  )
+  assert.equal(
+    stream.at(-1), dones[0],
+    `task.stream.done must be the last task stream frame; saw ${trace}`,
+  )
+  const fallbacks = stream.filter(frame => frame.type === 'task.stream.fallback')
+  if (fallbackReason) {
+    assert.equal(fallbacks.length, 1, `the withheld speech is reported once; saw ${trace}`)
+    assert.equal(fallbacks[0].streaming_fallback_reason, fallbackReason)
+    assert.ok(
+      stream.indexOf(fallbacks[0]) < stream.indexOf(terminals[0]),
+      `the fallback is reported before the stream closes; saw ${trace}`,
+    )
+  } else {
+    assert.equal(fallbacks.length, 0, `a faithful rendering needs no fallback; saw ${trace}`)
+  }
+  // The authoritative answer text goes out exactly once whether or not the
+  // rendering could be trusted.
+  assert.equal(
+    frames.filter(frame => (
+      frame.type === 'task.stream' && frame.category === 'text' && frame.taskId === taskId
+    )).length,
+    1,
+    'the authoritative answer text is published exactly once',
+  )
 }
 
 function assistantTranscriptsFor(frames, taskId) {
@@ -687,6 +757,123 @@ test('the lifecycle terminal stays behind the drain barrier (ESS-1110)', async (
     taskStreamFrames.at(-1).type, 'task.stream.done',
     'task.stream.done is the last frame of the task stream',
   )
+})
+
+// ESS-1168 finding 1: every failure branch must close the task stream the same
+// way. Each case below drives one shape of divergence through the real gateway
+// and asserts the full frame order, not just that a fallback appeared.
+const DIVERGENCE_BRANCHES = [
+  {
+    name: 'rewritten into a different answer',
+    session: 'ess1168-rewritten',
+    render: () => WEATHER_REWRITE,
+  },
+  {
+    name: 'expanded with the model’s own follow-up',
+    session: 'ess1168-expanded',
+    render: script => `${script}还需要我帮你看看明天的天气吗？`,
+  },
+  {
+    // Observed on the real qwen-audio-3.0-realtime-plus while measuring the
+    // verbatim shape: the model occasionally reads the instruction preamble
+    // out loud and only then the script.
+    name: 'prefixed with the instructions read out loud',
+    session: 'ess1168-preamble',
+    render: script => `禁止改写、概括、扩写、翻译、补充、省略、寒暄、提问或添加任何前后缀。${script}`,
+  },
+  {
+    name: 'truncated part-way through',
+    session: 'ess1168-truncated',
+    render: script => script.slice(0, 20),
+  },
+  {
+    name: 'silent — the rendering said nothing at all',
+    session: 'ess1168-empty',
+    render: () => '',
+  },
+  {
+    name: 'unverifiable — audio with no transcript to check it against',
+    session: 'ess1168-no-transcript',
+    render: script => script,
+    publishesTranscript: false,
+  },
+]
+
+for (const branch of DIVERGENCE_BRANCHES) {
+  test(`a rendering ${branch.name} closes the stream with done last`, async () => {
+    const previous = config.deterministicTtsModel
+    // Synthesis would rescue the delivery; this pins the withheld branch, which
+    // is the one whose frame order regressed.
+    config.deterministicTtsModel = ''
+    try {
+      const { taskId, frames } = await runDelegatedTurn({
+        answerText: WEATHER_ANSWER,
+        rewrite: WEATHER_REWRITE,
+        sessionId: branch.session,
+        render: branch.render,
+        publishesTranscript: branch.publishesTranscript ?? true,
+        terminalFrameType: 'task.stream.done',
+      })
+
+      assert.equal(
+        frames.filter(frame => frame.type === 'audio.delta').length, 0,
+        'no unverified audio reaches the client on any divergence',
+      )
+      assert.ok(
+        !frames.some(frame => (
+          frame.type === 'transcript.final'
+          && frame.role === 'assistant'
+          && frame.content !== WEATHER_ANSWER
+        )),
+        'nothing but the authoritative answer is ever attributed to the assistant',
+      )
+      assertStreamClosesLast(frames, taskId, {
+        fallbackReason: 'speech_not_verbatim',
+      })
+    } finally {
+      config.deterministicTtsModel = previous
+    }
+  })
+}
+
+// ESS-1168 finding 2: audio that cannot be checked is not evidence of anything.
+// Releasing it would assert a fidelity nobody measured, which is the delivery
+// this whole path exists to remove.
+test('audio with no transcript is withheld, not released on trust', async () => {
+  const previous = config.deterministicTtsModel
+  config.deterministicTtsModel = ''
+  try {
+    const { taskId, frames, notificationStatus, upstream } = await runDelegatedTurn({
+      answerText: WEATHER_ANSWER,
+      rewrite: WEATHER_REWRITE,
+      sessionId: 'ess1168-unverifiable',
+      render: script => script,
+      publishesTranscript: false,
+      terminalFrameType: 'task.stream.done',
+    })
+
+    assert.equal(
+      upstream.responses.filter(item => item.asked).length, 2,
+      'an unverifiable rendering is retried before it is given up on',
+    )
+    assert.equal(
+      frames.filter(frame => frame.type === 'audio.delta').length, 0,
+      'the audio existed upstream and still never reached the client',
+    )
+    assert.deepEqual(
+      assistantTranscriptsFor(frames, taskId), [WEATHER_ANSWER],
+      'the answer is still delivered, as text',
+    )
+    assert.notEqual(
+      notificationStatus, 'delivered',
+      'nobody heard it, so the notification is not spent',
+    )
+    assertStreamClosesLast(frames, taskId, {
+      fallbackReason: 'speech_not_verbatim',
+    })
+  } finally {
+    config.deterministicTtsModel = previous
+  }
 })
 
 test('fidelity ignores what a listener cannot hear', () => {

@@ -81,7 +81,9 @@ Codex 委托语音流先发布有序的 `task.stream.segment`，仅在 ACP 终�
 
 帧顺序不变：生命周期终态仍然等待任务与响应/音频 drain，`task.stream.done` 仍是
 任务流最后一帧。扣留位于这道屏障之内，而不是移动它——它决定一条话语**是否**被
-释放，不改变终态**何时**写出。
+释放，不改变终态**何时**写出。这在每条分支上都成立：扣留语音时，
+`task.stream.fallback` 在生命周期终态**之前**下发，因为终态与
+`task.stream.done` 收口任务流，其后不得再有任何帧。
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`、`listSkins`、`removeSkin`、`effectiveOrbSkin`、`skinsDirectory`、`validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`、`configureOrbWindow`、`ORB_CHANNELS` |

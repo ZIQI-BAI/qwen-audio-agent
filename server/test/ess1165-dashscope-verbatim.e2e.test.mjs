@@ -12,10 +12,17 @@
 //   QWEN_AUDIO_E2E=1 DASHSCOPE_API_KEY=... DASHSCOPE_WORKSPACE_ID=... \
 //     node --test server/test/ess1165-dashscope-verbatim.e2e.test.mjs
 //
-// Recorded result on qwen-audio-3.0-realtime-plus (2026-09-06):
-//   old speak shape       0/4 knowledge segments verbatim (rewrites, refusals)
-//   verbatim shape        4/4 verbatim
-//   verbatim, one shot    weather and knowledge answers read exactly
+// Recorded on qwen-audio-3.0-realtime-plus (2026-09-06), 3 rounds x 4 segments:
+//   old speak shape       0/4 verbatim (rewrites, refusals)
+//   verbatim shape        10/12 verbatim
+//
+// The verbatim shape is a mitigation, not a guarantee, and this file asserts it
+// as one. The observed failure is the model reading the instruction preamble
+// aloud before the script, which the gateway classifies as a divergence and
+// discards unheard. That is why the runtime holds and verifies every rendering
+// instead of trusting the prompt: at roughly 1 in 6 per attempt with one retry,
+// a few percent of answers still take the withheld path, and none of them may
+// reach the ear rewritten.
 //   deterministic TTS     qwen-tts returns mono/16-bit/24 kHz PCM, the exact
 //                         downlink contract, so the recovery path needs no
 //                         resampling
@@ -182,18 +189,27 @@ test('the old speak shape lets the real model rewrite the answer (ESS-1157)', {
   )
 })
 
-test('the verbatim shape makes the real model read every segment', {
+test('the verbatim shape is materially more faithful than the old one', {
   skip: ENABLED ? false : 'set QWEN_AUDIO_E2E=1 and DASHSCOPE_API_KEY to run',
 }, async () => {
+  // Asserting 4/4 would be asserting that a live model is deterministic. It is
+  // not, and that assertion flaked. What the fix rests on is that this shape
+  // moves the rate from "never" to "almost always", and that the runtime holds
+  // back and retries the remainder.
   const spoken = await speakAll(KNOWLEDGE_SEGMENTS, verbatimResponse)
   assert.equal(spoken.length, KNOWLEDGE_SEGMENTS.length)
-  spoken.forEach((text, index) => {
-    assert.ok(
-      isVerbatimSpeech(KNOWLEDGE_SEGMENTS[index], text),
-      `segment ${index} was not read verbatim:\n  want ${
-        KNOWLEDGE_SEGMENTS[index]}\n  got  ${text}`,
-    )
-  })
+  const verbatim = spoken.filter(
+    (text, index) => isVerbatimSpeech(KNOWLEDGE_SEGMENTS[index], text),
+  )
+  const report = spoken
+    .map((text, index) => `  [${index}] ${
+      isVerbatimSpeech(KNOWLEDGE_SEGMENTS[index], text) ? 'ok' : text}`)
+    .join('\n')
+  assert.ok(
+    verbatim.length >= KNOWLEDGE_SEGMENTS.length - 1,
+    `the verbatim shape should read almost every segment; ${
+      verbatim.length}/${KNOWLEDGE_SEGMENTS.length} matched:\n${report}`,
+  )
 })
 
 test('the real model reads a complete answer as one utterance', {
