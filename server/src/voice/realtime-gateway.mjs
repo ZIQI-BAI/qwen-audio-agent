@@ -27,6 +27,7 @@ import { VoiceOwnershipTracker } from './voice-ownership-tracker.mjs'
 import { streamingInputTranscript } from './input-transcript.mjs'
 import { CodexStreamProjector } from './codex-stream-projector.mjs'
 import { TaskStreamProtocol } from './task-stream-protocol.mjs'
+import { TaskTerminalDelivery } from './task-terminal-delivery.mjs'
 import { StreamingLatencyWindow } from './streaming-latency-window.mjs'
 import {
   ensureResponseContext,
@@ -375,6 +376,31 @@ export function attachRealtimeGateway(server, {
     })
     const taskStreamProtocol = new TaskStreamProtocol({
       send: frame => send(ws, frame),
+      log: connectionLogger,
+    })
+    // Single owner of "this task's terminal answer is spoken exactly once" on
+    // this connection. It must claim before `task.notification.pending` is
+    // handled, which TaskManager emits in the same tick as `task.completed`.
+    const terminalDelivery = new TaskTerminalDelivery({
+      claim: taskIds => taskManager.claimNotifications({
+        ownerId,
+        sessionId,
+        claimantId: notificationClaimantId,
+        taskIds,
+      }),
+      release: taskIds => taskManager.releaseNotificationClaims(taskIds, {
+        claimantId: notificationClaimantId,
+      }),
+      markDelivered: taskIds => taskManager.markNotificationsDelivered(taskIds, {
+        claimantId: notificationClaimantId,
+      }),
+      renew: taskIds => taskManager.renewNotificationClaims(taskIds, {
+        claimantId: notificationClaimantId,
+      }),
+      leaseRenewIntervalMs: Math.max(
+        1000,
+        Math.floor(config.taskNotificationClaimTtlMs / 3),
+      ),
       log: connectionLogger,
     })
     const codexStreamProjector = new CodexStreamProjector({
@@ -1218,10 +1244,14 @@ export function attachRealtimeGateway(server, {
         }
       }
       if (['task.completed', 'task.failed'].includes(event.type)) {
-        let wasStreamed = streamedTaskIds.has(task.id)
         const terminalIdentity = streamIdentity(
           task, task.streamGeneration || 1,
         )
+        // Idempotent on terminal delivery identity (session + task + stream
+        // generation), never on the answer text: two runs may legitimately
+        // produce the same words, while one run must never be replayed.
+        if (!terminalDelivery.begin(terminalIdentity)) return
+        let wasStreamed = streamedTaskIds.has(task.id)
         // Some ACP backends only publish a final task result and never emit
         // task.stream.chunk. Treat that final result as the last content
         // increment instead of completing the protocol before the result
@@ -1244,32 +1274,24 @@ export function attachRealtimeGateway(server, {
         )
         if (!wasStreamed) taskStreamProtocol.responseDone(terminalIdentity)
         if (wasStreamed) {
-          void codexStreamProjector.terminal(streamIdentity(
-            task,
-            task.streamGeneration || 1,
-          )).then(result => {
-            if (
+          // The streamed speech IS the notification delivery, so claim it now,
+          // synchronously. TaskManager emits `task.notification.pending` in
+          // this same tick; claiming only after the segments drain (tens of
+          // seconds for a long answer) let the announcement surface speak the
+          // same result again, and its context injection then made every
+          // remaining segment re-speak the whole answer (ESS-1156).
+          terminalDelivery.claimStream(terminalIdentity)
+          void codexStreamProjector.terminal(terminalIdentity).then(result => {
+            const streamed = !(
               event.type === 'task.failed'
               || result.streaming_fallback_reason
               || !outputEnabled
               || !frontend?.ready
-            ) {
-              claimPendingNotifications([task.id])
-              return
-            }
-            // The streamed speech is the notification delivery. Claim and
-            // confirm it atomically after every segment has drained so the
-            // final presentation is not spoken a second time.
-            const claimed = taskManager.claimNotifications({
-              ownerId,
-              sessionId,
-              claimantId: notificationClaimantId,
-              taskIds: [task.id],
-            })
-            taskManager.markNotificationsDelivered(
-              claimed.map(item => item.id),
-              { claimantId: notificationClaimantId },
             )
+            terminalDelivery.settle(terminalIdentity, { delivered: streamed })
+            // A streamed delivery that never reached the ear stays pending, so
+            // the announcement surface can still deliver the result once.
+            if (!streamed) claimPendingNotifications([task.id])
           })
           streamedTaskIds.delete(task.id)
         }
@@ -2601,6 +2623,9 @@ export function attachRealtimeGateway(server, {
       if (!connections?.size) voiceConnections.delete(ownerId)
       unsubscribeTasks()
       taskStreamProtocol.close('socket_closed')
+      // In-flight streamed answers die with the socket; hand their claims back
+      // so another delivery surface can still deliver them exactly once.
+      terminalDelivery.close()
       clearResponseCandidate()
       turnGeneration = ++turnSequence
       committedTurnGeneration = turnGeneration
