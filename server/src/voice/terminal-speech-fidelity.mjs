@@ -72,7 +72,7 @@ export class TerminalSpeechFidelity {
     const existing = this.entries.get(key)
     if (existing) return existing
     const created = {
-      segments: 0, divergences: [], delivered: null, delivery: null,
+      segments: 0, silent: 0, divergences: [], delivered: null, delivery: null,
     }
     this.entries.set(key, created)
     while (this.entries.size > this.maxEntries) {
@@ -82,18 +82,26 @@ export class TerminalSpeechFidelity {
   }
 
   /**
-   * Record one delivered segment. `spoken` equal to `expected` marks a verbatim
-   * delivery; anything else is a divergence that was dropped before playback.
+   * Record one segment.
+   *
+   * The verdict is about *audible* delivery, not about transcript agreement:
+   * a response that agreed with the text but carried no audio was never heard,
+   * so it is not a delivery (ESS-1168). A divergence is recorded as evidence
+   * only — it was dropped before playback and nobody heard it either.
    */
-  record(identity, { expected, spoken }) {
+  record(identity, { expected, spoken, audible = true }) {
     const entry = this.entry(identity)
-    if (isVerbatimSpeech(expected, spoken)) {
-      entry.segments += 1
-      entry.delivered = entry.delivered !== false
-      entry.delivery ||= 'verbatim'
+    if (!isVerbatimSpeech(expected, spoken)) {
+      entry.divergences.push({ expected, spoken })
       return entry
     }
-    entry.divergences.push({ expected, spoken })
+    if (!audible) {
+      entry.silent += 1
+      return entry
+    }
+    entry.segments += 1
+    entry.delivered = entry.delivered !== false
+    entry.delivery ||= 'verbatim'
     return entry
   }
 
@@ -106,7 +114,11 @@ export class TerminalSpeechFidelity {
     return entry
   }
 
-  /** Record that no faithful delivery was possible for this identity. */
+  /**
+   * Record that nothing audible carried this answer — the reading could not be
+   * trusted, or the provider produced no audio at all. The task notification
+   * must not be marked delivered on the strength of it.
+   */
   recordUndelivered(identity) {
     const entry = this.entry(identity)
     entry.delivered = false

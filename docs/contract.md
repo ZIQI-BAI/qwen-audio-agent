@@ -84,17 +84,19 @@ order: retry the reading (`QWEN_AUDIO_AGENT_TERMINAL_SPEECH_RETRIES`, default
 1), then deterministic text-to-speech (`QWEN_AUDIO_AGENT_TTS_MODEL`, empty
 disables it), then the answer as text with
 `streaming_fallback_reason: speech_not_verbatim`. No step narrates the answer in
-the model's own words. `task.stream.done` and the lifecycle terminal carry
-`delivery` (`verbatim` / `synthesized` / `null`) and `verbatim`, so a run is
-judged from its frames rather than by ear.
+the model's own words.
 
-Ordering follows from the hold: the lifecycle terminal is written once the
-answer has been produced **and** verified, and the held audio is released after
-it. So the terminal precedes the answer's unique `audio.done`, and
-`task.stream.done` is the last frame of the task stream. This is strictly
-stronger than the older "terminal waits for the response/audio drain" barrier —
-the terminal can no longer describe a delivery that was not produced, and it can
-no longer arrive after the listener already heard the answer.
+`task.stream.done` and the lifecycle terminal carry `delivery`
+(`verbatim` / `synthesized` / `null`) and `verbatim`, so a run is judged from its
+frames rather than by ear. Both describe **audible** delivery: a response whose
+transcript matched but which carried no audio reports `null`, because nobody
+heard it. Only an audible delivery marks the task notification delivered; every
+other outcome releases the claim instead of spending it.
+
+Frame order is unchanged: the lifecycle terminal still waits for the task and
+the response/audio drain, and `task.stream.done` is the last frame of the task
+stream. The hold sits inside that barrier rather than moving it — it decides
+*whether* an utterance is released, not *when* the terminal is written.
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`, `listSkins`, `removeSkin`, `effectiveOrbSkin`, `skinsDirectory`, `validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`, `configureOrbWindow`, `ORB_CHANNELS` |

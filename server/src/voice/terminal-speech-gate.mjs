@@ -30,6 +30,7 @@ export class TerminalSpeechGate {
       identity: { ...identity },
       expected: String(expected || ''),
       frames: [],
+      audioFrames: 0,
       verdict: null,
       spoken: '',
     })
@@ -48,7 +49,18 @@ export class TerminalSpeechGate {
     const gate = this.gates.get(responseId)
     if (!gate) return false
     gate.frames.push(frame)
+    if (frame?.type === 'audio.delta') gate.audioFrames += 1
     return true
+  }
+
+  /**
+   * Did this utterance carry audio?
+   *
+   * A transcript alone is not a delivery anyone heard, so callers use this to
+   * keep a text-only response from counting as spoken (ESS-1168).
+   */
+  audible(responseId) {
+    return (this.gates.get(responseId)?.audioFrames || 0) > 0
   }
 
   /** Compare what was said with what was asked, without releasing anything. */

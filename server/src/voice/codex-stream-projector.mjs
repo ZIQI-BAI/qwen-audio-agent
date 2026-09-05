@@ -55,20 +55,6 @@ export class CodexStreamProjector {
     return this.finished.has(keyOf(identity))
   }
 
-  /**
-   * True when the segment being spoken right now is the last one.
-   *
-   * Callers use this to hold a verified utterance back until the lifecycle
-   * terminal has been written. It is only meaningful from inside `speak`,
-   * after the segment has been taken off `pending`: terminal already requested
-   * and nothing else queued means nothing more will be spoken.
-   */
-  isFinalSegment(identity) {
-    const state = this.streams.get(keyOf(identity))
-    if (!state) return false
-    return state.terminal && !state.pending.length && !state.buffer
-  }
-
   state(identity) {
     const key = keyOf(identity)
     let state = this.streams.get(key)

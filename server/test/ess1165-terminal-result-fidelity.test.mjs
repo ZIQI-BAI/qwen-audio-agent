@@ -32,7 +32,12 @@
 //      that already happened, which is what the ESS-1165 review rejected;
 //   3. recovery is deterministic: the discarded attempt is retried, then
 //      synthesized, then delivered as text. No path narrates the answer in the
-//      model's own words.
+//      model's own words, and only audio that actually went out can mark the
+//      task notification delivered (ESS-1168).
+//
+// Frame ordering follows ESS-1110 and the ESS-1168 ruling: the lifecycle
+// terminal stays behind the response/audio drain barrier, and
+// `task.stream.done` is the last frame of the task stream.
 
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
@@ -153,7 +158,7 @@ function verbatimContent(instructions) {
  * the reader instructions and has its conversation input removed is read back
  * verbatim, as the real model does.
  */
-function startRealtimeUpstream({ rewrite, rewriteAttempts = 0 }) {
+function startRealtimeUpstream({ rewrite, rewriteAttempts = 0, silent = false }) {
   const server = createServer()
   const wss = new WebSocketServer({ server })
   const responses = []
@@ -195,9 +200,11 @@ function startRealtimeUpstream({ rewrite, rewriteAttempts = 0 }) {
       ws.send(JSON.stringify({ type: 'response.created', response: { id } }))
       setTimeout(() => {
         if (ws.readyState !== WebSocket.OPEN) return
-        ws.send(JSON.stringify({
-          type: 'response.audio.delta', response_id: id, delta: AUDIO_FRAME,
-        }))
+        if (!silent) {
+          ws.send(JSON.stringify({
+            type: 'response.audio.delta', response_id: id, delta: AUDIO_FRAME,
+          }))
+        }
         ws.send(JSON.stringify({
           type: 'response.audio_transcript.done',
           response_id: id,
@@ -374,9 +381,10 @@ function waitFor(frames, predicate, timeoutMs = 8000) {
 }
 
 async function runDelegatedTurn({
-  answerText, rewrite, sessionId, rewriteAttempts = 0, terminalFrameType = 'task.stream.done',
+  answerText, rewrite, sessionId, rewriteAttempts = 0, silent = false,
+  terminalFrameType = 'task.stream.done',
 }) {
-  const upstream = await startRealtimeUpstream({ rewrite, rewriteAttempts })
+  const upstream = await startRealtimeUpstream({ rewrite, rewriteAttempts, silent })
   const server = await startGateway(upstream.url)
   const { socket, frames } = await connectClient(server, sessionId)
   await waitFor(frames, frame => frame.type === 'voice.ready')
@@ -404,7 +412,23 @@ async function runDelegatedTurn({
   await new Promise(resolve => server.close(resolve))
   await upstream.close()
 
-  return { taskId: created.id, turnId, frames, done, upstream }
+  return {
+    taskId: created.id,
+    turnId,
+    frames,
+    done,
+    upstream,
+    // What the task ledger believes about its own notification, which is the
+    // question "was the answer delivered?" in its authoritative form.
+    notificationStatus: taskManager.get(created.id)?.notificationStatus ?? null,
+  }
+}
+
+/** Did the Gateway tell the client this task's notification was delivered? */
+function notificationDelivered(frames, taskId) {
+  return frames.some(frame => (
+    frame.type === 'task.notification.delivered' && frame.task?.id === taskId
+  ))
 }
 
 function assistantTranscriptsFor(frames, taskId) {
@@ -476,7 +500,9 @@ test('the knowledge answer the real model dropped entirely is now read verbatim'
 })
 
 test('a rewritten utterance never reaches the client, and the retry does', async () => {
-  const { taskId, frames, done, upstream } = await runDelegatedTurn({
+  const {
+    taskId, frames, done, upstream, notificationStatus,
+  } = await runDelegatedTurn({
     answerText: WEATHER_ANSWER,
     rewrite: WEATHER_REWRITE,
     sessionId: 'ess1165-retry',
@@ -499,13 +525,14 @@ test('a rewritten utterance never reaches the client, and the retry does', async
     )),
     'the rewritten transcript never left the gateway',
   )
-  // Every audio frame the client saw belongs to the accepted reading.
   const audioResponseIds = new Set(
     frames.filter(frame => frame.type === 'audio.delta').map(frame => frame.responseId),
   )
   assert.equal(audioResponseIds.size, 1, 'only one utterance produced audio')
   assert.equal(done.verbatim, true)
   assert.equal(done.delivery, 'verbatim')
+  assert.equal(notificationStatus, 'delivered', 'the answer was heard, so it is delivered')
+  assert.equal(notificationDelivered(frames, taskId), true)
 })
 
 test('an answer the model will not read is synthesized, not narrated', async () => {
@@ -513,7 +540,7 @@ test('an answer the model will not read is synthesized, not narrated', async () 
   const previous = config.deterministicTtsBaseUrl
   config.deterministicTtsBaseUrl = tts.url
   try {
-    const { taskId, frames, done } = await runDelegatedTurn({
+    const { taskId, frames, done, notificationStatus } = await runDelegatedTurn({
       answerText: WEATHER_ANSWER,
       rewrite: WEATHER_REWRITE,
       sessionId: 'ess1165-synth',
@@ -542,17 +569,18 @@ test('an answer the model will not read is synthesized, not narrated', async () 
     assert.equal(audio[0].sampleRate, 24000)
     assert.equal(done.delivery, 'synthesized')
     assert.equal(done.verbatim, true, 'the delivered content is the answer')
+    assert.equal(notificationStatus, 'delivered')
   } finally {
     config.deterministicTtsBaseUrl = previous
     await tts.close()
   }
 })
 
-test('with no synthesis the answer degrades to text, never to a rewrite', async () => {
+test('with no synthesis the answer degrades to text and stays undelivered', async () => {
   const previous = config.deterministicTtsModel
   config.deterministicTtsModel = ''
   try {
-    const { taskId, frames } = await runDelegatedTurn({
+    const { taskId, frames, notificationStatus } = await runDelegatedTurn({
       answerText: KNOWLEDGE_ANSWER,
       rewrite: KNOWLEDGE_REWRITE,
       sessionId: 'ess1165-textonly',
@@ -577,12 +605,49 @@ test('with no synthesis the answer degrades to text, never to a rewrite', async 
     )
     const fallback = frames.find(frame => frame.type === 'task.stream.fallback')
     assert.equal(fallback.streaming_fallback_reason, 'speech_not_verbatim')
+    // The claim is released rather than consumed: nothing was heard, so the
+    // notification must not be spent — and it is not re-announced either,
+    // because announcing it means narrating the answer in the model's own
+    // words (ESS-1168 blocking item 1).
+    assert.notEqual(notificationStatus, 'delivered')
+    assert.equal(notificationDelivered(frames, taskId), false)
   } finally {
     config.deterministicTtsModel = previous
   }
 })
 
-test('the lifecycle terminal precedes the answer\'s audio.done', async () => {
+test('a transcript with no audio is not a delivery', async () => {
+  const previous = config.deterministicTtsModel
+  config.deterministicTtsModel = ''
+  try {
+    const { taskId, frames, done, notificationStatus } = await runDelegatedTurn({
+      answerText: WEATHER_ANSWER,
+      rewrite: WEATHER_REWRITE,
+      sessionId: 'ess1165-silent',
+      // The model reads the answer back, but the provider emits no audio.
+      silent: true,
+    })
+
+    assert.deepEqual(
+      assistantTranscriptsFor(frames, taskId), [WEATHER_ANSWER],
+      'the text still reaches the client',
+    )
+    assert.equal(
+      frames.filter(frame => frame.type === 'audio.delta').length, 0,
+      'nothing was audible',
+    )
+    assert.equal(done.delivery, null, 'a silent response is not a spoken delivery')
+    assert.equal(done.verbatim, null)
+    assert.notEqual(
+      notificationStatus, 'delivered',
+      'an answer nobody could hear must not spend the notification',
+    )
+  } finally {
+    config.deterministicTtsModel = previous
+  }
+})
+
+test('the lifecycle terminal stays behind the drain barrier (ESS-1110)', async () => {
   const { taskId, frames } = await runDelegatedTurn({
     answerText: WEATHER_ANSWER,
     rewrite: WEATHER_REWRITE,
@@ -594,36 +659,33 @@ test('the lifecycle terminal precedes the answer\'s audio.done', async () => {
     && frame.role === 'assistant'
     && frame.taskId === taskId
   )).responseId
-  const terminal = frames.findIndex(frame => (
+  const indexOf = predicate => frames.findIndex(predicate)
+  const terminal = indexOf(frame => (
     frame.type === 'task.stream'
     && frame.category === 'terminal'
     && frame.taskId === taskId
   ))
-  const streamDone = frames.findIndex(frame => (
+  const streamDone = indexOf(frame => (
     frame.type === 'task.stream.done' && frame.taskId === taskId
   ))
-  const audioDones = frames
-    .map((frame, index) => ({ frame, index }))
-    .filter(item => (
-      item.frame.type === 'audio.done'
-      && item.frame.responseId === answerResponseId
-    ))
+  const audioDones = frames.filter(frame => (
+    frame.type === 'audio.done' && frame.responseId === answerResponseId
+  ))
+  const lastAudioDone = frames.lastIndexOf(audioDones.at(-1))
 
   assert.equal(audioDones.length, 1, 'the answer has exactly one audio.done')
-  assert.ok(terminal >= 0 && streamDone >= 0)
+  // ESS-1168 ruled that ESS-1110's order stands: the terminal follows the
+  // response/audio drain rather than preceding the answer's audio.done.
   assert.ok(
-    terminal < streamDone && streamDone < audioDones[0].index,
-    'terminal -> task.stream.done -> the answer\'s audio.done, in that order',
+    lastAudioDone < terminal && terminal < streamDone,
+    'audio drain -> lifecycle terminal -> task.stream.done',
   )
-  // The barrier ESS-1110 asks for still holds: the terminal is written only
-  // after the answer exists and has been verified, so it can never announce a
-  // delivery that has not been produced.
-  const firstAnswerAudio = frames.findIndex(frame => (
-    frame.type === 'audio.delta' && frame.responseId === answerResponseId
+  const taskStreamFrames = frames.filter(frame => (
+    frame.type.startsWith('task.stream') && (frame.taskId === taskId)
   ))
-  assert.ok(
-    firstAnswerAudio > terminal,
-    'the answer audio is released after the terminal, not before it',
+  assert.equal(
+    taskStreamFrames.at(-1).type, 'task.stream.done',
+    'task.stream.done is the last frame of the task stream',
   )
 })
 

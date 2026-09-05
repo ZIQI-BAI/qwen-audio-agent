@@ -418,19 +418,6 @@ export function attachRealtimeGateway(server, {
       sampleRate: null,
       log: connectionLogger,
     })
-    // Utterances verified but deliberately still held, so the lifecycle
-    // terminal can be written before the answer's audio.done. Keyed by task
-    // stream identity, because that is what onDone knows.
-    const heldFinalUtterances = new Map()
-    const releaseHeldUtterance = identity => {
-      const key = TerminalSpeechFidelity.key(identity)
-      const responseId = heldFinalUtterances.get(key)
-      if (!responseId) return false
-      heldFinalUtterances.delete(key)
-      terminalSpeechGate.release(responseId)
-      return true
-    }
-
     /**
      * Speak one task-answer segment and only let it through once it is known
      * to be the answer.
@@ -466,22 +453,18 @@ export function attachRealtimeGateway(server, {
           return outcome
         }
         if (terminalSpeechGate.verdict(responseId) !== false) {
+          // A response that agreed with the text but produced no audio was
+          // never heard. It is released — the transcript is still the answer —
+          // but it does not count as a spoken delivery (ESS-1168).
           terminalSpeechFidelity.record(identity, {
             expected: text,
             spoken: text,
+            audible: terminalSpeechGate.audible(responseId),
           })
-          // `context` is the projector's own stream identity; `identity` is the
-          // delivery identity the terminal frame carries, and the two key
-          // differently.
-          if (codexStreamProjector.isFinalSegment(context)) {
-            // Held until onDone has written the lifecycle terminal, so the
-            // answer's audio.done follows the terminal instead of preceding it.
-            heldFinalUtterances.set(
-              TerminalSpeechFidelity.key(identity), responseId,
-            )
-          } else {
-            terminalSpeechGate.release(responseId)
-          }
+          // Released as soon as the verdict is in, so the lifecycle terminal
+          // still lands behind the response/audio drain barrier ESS-1110 asks
+          // for and ESS-1168 confirmed.
+          terminalSpeechGate.release(responseId)
           return outcome
         }
         const divergence = terminalSpeechGate.divergence(responseId)
@@ -606,15 +589,7 @@ export function attachRealtimeGateway(server, {
         sampleRate: audio.sampleRate,
       })
       terminalSpeechFidelity.recordSynthesized(identity)
-      // Held like a verified realtime utterance so the lifecycle terminal
-      // still precedes the answer's audio.done.
-      terminalSpeechGate.open(responseId, { expected: text, identity })
-      terminalSpeechGate.hold(responseId, {
-        type: 'audio.done', responseId, turnId: context.turnId,
-      })
-      heldFinalUtterances.set(
-        TerminalSpeechFidelity.key(identity), responseId,
-      )
+      send(ws, { type: 'audio.done', responseId, turnId: context.turnId })
       return true
     }
 
@@ -673,7 +648,11 @@ export function attachRealtimeGateway(server, {
           verbatim,
           delivery,
         })
-        releaseHeldUtterance(result)
+        // The projector resolves `terminal()` with this same object, so the
+        // task.completed handler settles the notification on the verdict
+        // rather than on "a response finished".
+        result.delivery = delivery
+        result.delivered = verbatim === true
       },
       onFallback: result => {
         connectionLogger.warn('task.streaming_fallback', result)
@@ -1544,21 +1523,24 @@ export function attachRealtimeGateway(server, {
           // remaining segment re-speak the whole answer (ESS-1156).
           terminalDelivery.claimStream(terminalIdentity)
           void codexStreamProjector.terminal(terminalIdentity).then(result => {
-            const streamed = !(
+            // "A response completed" is not delivery. The answer counts as
+            // delivered only when audio carrying it actually went out — read
+            // as written, or synthesized (ESS-1168).
+            const streamed = result.delivered === true && !(
               event.type === 'task.failed'
-              // A reading the model would not do faithfully still delivered the
-              // answer, as text. Handing it back would only let the
-              // announcement surface narrate it in the model's own words —
-              // the very failure ESS-1165 is about.
-              || (result.streaming_fallback_reason
-                && result.streaming_fallback_reason !== 'speech_not_verbatim')
               || !outputEnabled
               || !frontend?.ready
             )
             terminalDelivery.settle(terminalIdentity, { delivered: streamed })
-            // A streamed delivery that never reached the ear stays pending, so
-            // the announcement surface can still deliver the result once.
-            if (!streamed) claimPendingNotifications([task.id])
+            if (streamed) return
+            // The claim is released either way. It is only handed straight to
+            // the announcement surface when speech failed for a reason that
+            // surface can fix; a reading the model would not do faithfully is
+            // not one of those, because announcing it means narrating the
+            // answer in the model's own words — the ESS-1165 failure itself.
+            if (result.streaming_fallback_reason !== 'speech_not_verbatim') {
+              claimPendingNotifications([task.id])
+            }
           })
           streamedTaskIds.delete(task.id)
         }
@@ -2912,7 +2894,6 @@ export function attachRealtimeGateway(server, {
       // Anything still awaiting verification cannot be delivered now, and it
       // was never sent, so it is dropped rather than flushed.
       terminalSpeechGate.close()
-      heldFinalUtterances.clear()
       clearResponseCandidate()
       turnGeneration = ++turnSequence
       committedTurnGeneration = turnGeneration
