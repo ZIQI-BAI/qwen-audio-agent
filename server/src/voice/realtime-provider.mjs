@@ -410,6 +410,22 @@ export class RealtimeFrontend {
     })
   }
 
+  /**
+   * Speak text the model must not rewrite — a delegated task's final answer.
+   * Providers without a verbatim contract fall back to the ordinary speak
+   * response, and the gateway's fidelity check then reports the difference.
+   */
+  speakVerbatim(text, origin = 'agent', context = {}, { shouldSpeak } = {}) {
+    const content = String(text || '').trim()
+    if (!content) return Promise.resolve()
+    const build = this.provider.buildVerbatimSpeechResponse
+      || this.provider.buildSpeakResponse
+    return this.enqueueResponse(origin, context, () => {
+      if (shouldSpeak && !shouldSpeak()) return false
+      this.send(this.protocol.responseCreate(build(content)))
+    })
+  }
+
   async injectResult(
     text,
     origin = 'announcement',

@@ -542,6 +542,29 @@ export const config = {
   codexSpeechStreaming: String(
     process.env.QWEN_AUDIO_AGENT_CODEX_SPEECH_STREAMING || 'true',
   ).toLowerCase() !== 'false',
+  // How many times a task answer the model refused to read as written is
+  // re-requested. Each attempt is discarded unheard, so a retry cannot
+  // duplicate the answer; the bound keeps a stubborn model from stalling the
+  // turn (ESS-1165).
+  terminalSpeechRetries: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_TERMINAL_SPEECH_RETRIES,
+    1,
+    { min: 0, max: 3 },
+  ),
+  // Deterministic text-to-speech, used only as the terminal recovery path when
+  // the realtime model will not read the answer as written. Empty model
+  // disables it and the delivery degrades to text with an explicit fallback
+  // reason rather than to a rewritten answer.
+  deterministicTtsModel: String(
+    process.env.QWEN_AUDIO_AGENT_TTS_MODEL ?? 'qwen-tts',
+  ).trim(),
+  deterministicTtsVoice: String(
+    process.env.QWEN_AUDIO_AGENT_TTS_VOICE || 'Cherry',
+  ).trim(),
+  deterministicTtsBaseUrl: String(
+    process.env.QWEN_AUDIO_AGENT_TTS_BASE_URL
+    || 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+  ).trim(),
 }
 
 export function realtimeUrl(baseUrl, model) {

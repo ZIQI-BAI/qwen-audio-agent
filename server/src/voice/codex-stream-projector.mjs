@@ -83,6 +83,26 @@ export class CodexStreamProjector {
     this.flushReady(state)
   }
 
+  /**
+   * Project an answer that is already complete as ONE segment.
+   *
+   * Sentence splitting exists to start speaking before an incremental ACP
+   * stream has finished. A backend that only publishes a final result gains
+   * nothing from it and pays for it: every segment is a separate realtime
+   * response, so N segments are N chances for the model to answer instead of
+   * read, and N `audio.done` frames for a single answer (ESS-1157/ESS-1165).
+   */
+  pushComplete(identity, text) {
+    if (this.isFinished(identity)) return
+    const state = this.state(identity)
+    if (state.terminal) throw new Error('stream_already_terminal')
+    if (state.fallback) return
+    const content = String(text || '')
+    if (!content) return
+    state.text += content
+    this.enqueue(state, content)
+  }
+
   fallback(identity, reason, chunk = '') {
     if (this.isFinished(identity)) return
     const state = this.state(identity)

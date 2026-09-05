@@ -60,6 +60,28 @@ Codex 委托语音流先发布有序的 `task.stream.segment`，仅在 ACP 终�
 全部 drain 后发布 `task.stream.done`。`task.stream.fallback` 携带完整结果
 回退原因，`task.stream.aborted` 收口取消流，`task.stream.first_audio` 上报
 首段开始到首个音频帧的延迟；服务端日志同时维护最近 100 个样本的 P95。
+
+### 委派任务最终答案的交付
+
+委派任务的答案是权威内容，因此由 realtime 模型朗读而不是重新组织，并且在任何
+人听到之前先校验这次朗读。一次性到达的结果按单条话语交付，所以一个完整答案只有
+一份最终 transcript、一次 TTS、一个 `audio.done`。
+
+每条话语都先在 Gateway 扣留，直到它的 transcript 与被要求朗读的文本比对完成。
+被改写的话语整条丢弃——客户端连一帧都不会收到——随后按固定顺序恢复：重试朗读
+（`QWEN_AUDIO_AGENT_TERMINAL_SPEECH_RETRIES`，默认 1）、确定性 TTS
+（`QWEN_AUDIO_AGENT_TTS_MODEL`，留空即关闭）、以文本交付答案并带
+`streaming_fallback_reason: speech_not_verbatim`。任何一步都不会用模型自己的话
+转述答案。
+
+`task.stream.done` 与生命周期终态携带 `delivery`（`verbatim` / `synthesized` /
+`null`）和 `verbatim`，判定因此可以从帧日志复核，而不必靠耳朵。两者描述的都是
+**可听交付**：transcript 一致但没有音频的响应报告 `null`，因为没有人听见。只有
+可听交付才把任务通知标记为已交付；其余情况一律释放 claim，而不是消费掉它。
+
+帧顺序不变：生命周期终态仍然等待任务与响应/音频 drain，`task.stream.done` 仍是
+任务流最后一帧。扣留位于这道屏障之内，而不是移动它——它决定一条话语**是否**被
+释放，不改变终态**何时**写出。
 | `qwen-audio-agent/settings` | `createSettingsStore` |
 | `qwen-audio-agent/skin-store` | `importSkin`、`listSkins`、`removeSkin`、`effectiveOrbSkin`、`skinsDirectory`、`validateSkinPackage` |
 | `qwen-audio-agent/orb/main` | `bindOrbShell`、`configureOrbWindow`、`ORB_CHANNELS` |
