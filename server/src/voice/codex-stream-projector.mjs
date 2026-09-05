@@ -1,6 +1,7 @@
 const DEFAULT_MAX_CHARS = 120
 const DEFAULT_WINDOW_MS = 350
 const DEFAULT_MAX_PENDING = 3
+const DEFAULT_MAX_FINISHED = 64
 
 function keyOf(value = {}) {
   return [value.requestId, value.turnId, value.taskId, value.generation]
@@ -28,6 +29,7 @@ export class CodexStreamProjector {
     maxChars = DEFAULT_MAX_CHARS,
     windowMs = DEFAULT_WINDOW_MS,
     maxPending = DEFAULT_MAX_PENDING,
+    maxFinished = DEFAULT_MAX_FINISHED,
     setTimer = setTimeout,
     clearTimer = clearTimeout,
   } = {}) {
@@ -41,7 +43,16 @@ export class CodexStreamProjector {
     this.maxPending = Math.max(1, maxPending)
     this.setTimer = setTimer
     this.clearTimer = clearTimer
+    this.maxFinished = Math.max(1, maxFinished)
     this.streams = new Map()
+    // Streams that already reached terminal. Their state is gone, so without
+    // this ledger a late chunk for the same identity would silently open a
+    // second stream and speak the same terminal answer again (ESS-1156).
+    this.finished = new Map()
+  }
+
+  isFinished(identity) {
+    return this.finished.has(keyOf(identity))
   }
 
   state(identity) {
@@ -61,6 +72,7 @@ export class CodexStreamProjector {
   }
 
   push(identity, chunk) {
+    if (this.isFinished(identity)) return
     const state = this.state(identity)
     if (state.terminal) throw new Error('stream_already_terminal')
     if (state.fallback) return
@@ -72,6 +84,7 @@ export class CodexStreamProjector {
   }
 
   fallback(identity, reason, chunk = '') {
+    if (this.isFinished(identity)) return
     const state = this.state(identity)
     const text = String(chunk || '')
     state.text += text
@@ -174,6 +187,8 @@ export class CodexStreamProjector {
   }
 
   terminal(identity) {
+    const settled = this.finished.get(keyOf(identity))
+    if (settled) return Promise.resolve(settled)
     const state = this.state(identity)
     state.terminal = true
     if (state.timer) {
@@ -195,6 +210,10 @@ export class CodexStreamProjector {
       final_sequence: state.sequence - 1,
       streaming_fallback_reason: state.fallback,
       aborted: state.aborted,
+    }
+    this.finished.set(state.key, result)
+    while (this.finished.size > this.maxFinished) {
+      this.finished.delete(this.finished.keys().next().value)
     }
     this.onDone(result)
     state.resolveDone(result)
