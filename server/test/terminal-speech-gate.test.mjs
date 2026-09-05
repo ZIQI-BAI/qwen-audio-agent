@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { TerminalSpeechGate } from '../src/voice/terminal-speech-gate.mjs'
+import { isVerbatimSpeech } from '../src/voice/terminal-speech-fidelity.mjs'
 import {
   DeterministicSpeech,
   decodeWav,
@@ -152,4 +153,39 @@ test('PCM is framed on whole samples', () => {
   assert.equal(frames.length, 3, '5 rounds down to 4 bytes per frame')
   const joined = Buffer.concat(frames.map(frame => Buffer.from(frame, 'base64')))
   assert.deepEqual(joined, pcm, 'framing loses nothing')
+})
+
+// The gate releases whatever `isVerbatimSpeech` accepts, so the comparison is
+// the last thing standing between a wrong number and the user's ear.
+// Normalisation has to forgive punctuation — a transcript renders it
+// inconsistently — but forgiving it next to a digit changes the value: `10+2=12`
+// and `10212` are not the same answer, and neither are `-3°C` and `3°C`.
+test('a symbol that carries a number is never normalised away', () => {
+  const different = [
+    ['温度范围 -3～5°C', '温度范围 35°C', 'a range collapsed into one number'],
+    ['10+2=12', '10212', 'an expression collapsed into digits'],
+    ['今晚最低 -3°C', '今晚最低 3°C', 'a dropped minus sign flips the value'],
+    ['三点零五分是 3:05', '三点零五分是 305', 'a dropped colon is a different time'],
+    ['误差 0.5 米', '误差 05 米', 'a dropped decimal point is a different length'],
+    ['涨了 50%', '涨了 50', 'a dropped percent sign is a different quantity'],
+    ['3-5 天', '35 天', 'a range read as one number'],
+  ]
+  for (const [expected, spoken, why] of different) {
+    assert.equal(
+      isVerbatimSpeech(expected, spoken), false,
+      `${why}: ${expected} / ${spoken}`,
+    )
+  }
+})
+
+test('punctuation a listener cannot hear is still forgiven', () => {
+  const same = [
+    ['杭州二十五摄氏度，多云。', '杭州二十五摄氏度 多云'],
+    ['— Jackson\'Avatar', '- Jackson’Avatar'],
+    ['新版 Responses API', '新版 responses api'],
+    ['结果 — 完成', '结果 完成'],
+  ]
+  for (const [expected, spoken] of same) {
+    assert.equal(isVerbatimSpeech(expected, spoken), true, `${expected} / ${spoken}`)
+  }
 })

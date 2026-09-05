@@ -6,28 +6,55 @@ import {
 // Differences that a listener cannot hear. Punctuation and whitespace are not
 // spoken, and a transcript renders them inconsistently for the same audio, so
 // comparing them would report fidelity failures nobody experienced.
-const IGNORED = new RegExp(
-  '[\\s'
-  + '\\u3000-\\u303f'   // CJK punctuation
-  + '\\uff01-\\uff20'   // fullwidth punctuation
-  + '\\uff3b-\\uff40'
-  + '\\uff5b-\\uff65'
-  + '\\u2010-\\u2027'   // dashes, quotes, ellipsis
-  + '\\u2030-\\u205e'
-  + '!-/:-@\\[-`{-~'    // ASCII punctuation
-  + ']+',
-  'gu',
-)
+//
+// The set is an explicit allowlist. Sweeping up the ASCII punctuation ranges
+// instead also swallows `+ = % ~ : .` and every dash, and then `10+2=12` and
+// `10212`, or `-3°C` and `3°C`, compare equal — a wrong number would be
+// released as verbatim. Mathematical, unit and currency symbols therefore stay
+// significant, and so does anything sitting next to a digit.
+const IGNORABLE = new Set([
+  ...'。．.，、,；;：:！!？?…‥·',
+  ...'「」『』《》〈〉（）()［］[]｛｝{}【】',
+  ...'“”‘’"\'`«»',
+  ...'—–‒―-−~',
+])
+
+const DIGIT = /\p{Nd}/u
+
+/**
+ * True when the nearest non-whitespace neighbour in direction `step` is a
+ * digit. Even ignorable punctuation carries the value there: a dash is a sign
+ * or a range, a colon a time, a period a decimal.
+ */
+function touchesDigit(source, index, step) {
+  for (let at = index + step; at >= 0 && at < source.length; at += step) {
+    const character = source[at]
+    if (/\s/u.test(character)) continue
+    return DIGIT.test(character)
+  }
+  return false
+}
 
 /**
  * Normalize one utterance for comparison against the text it was asked to read.
  */
 export function normalizeSpokenText(value) {
-  return String(value || '')
+  const source = String(value || '')
     .replaceAll(VERBATIM_SPEECH_OPEN_TAG, '')
     .replaceAll(VERBATIM_SPEECH_CLOSE_TAG, '')
-    .replace(IGNORED, '')
-    .toLowerCase()
+    .normalize('NFKC')
+  let normalized = ''
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]
+    if (/\s/u.test(character)) continue
+    if (
+      IGNORABLE.has(character)
+      && !touchesDigit(source, index, -1)
+      && !touchesDigit(source, index, 1)
+    ) continue
+    normalized += character
+  }
+  return normalized.toLowerCase()
 }
 
 /**
